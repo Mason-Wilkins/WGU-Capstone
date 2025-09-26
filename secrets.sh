@@ -1,0 +1,1 @@
+export FLASK_APP_SECRET_KEY="masonwilkinswgu2025"
