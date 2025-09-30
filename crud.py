@@ -1,5 +1,6 @@
 import yfinance as yf
 import pandas as pd
+from model import connect_to_db
 
 dat = yf.Ticker("MSFT")
 dat.info
@@ -19,5 +20,6 @@ print(tickers)
 # print(data)
 
 if __name__ == "__main__":
-    main()
+    from server import app
+    connect_to_db(app)
     
