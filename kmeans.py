@@ -3,7 +3,6 @@ from typing import Optional, Tuple
 
 class KMeans:
 
-
     def __init__(
             self,
             n_clusters: int,

@@ -4,6 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from model import connect_to_db
 from kmeans import KMeans
+import werkzeug
 
 
 def do_stuff():

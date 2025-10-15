@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"name": "src",
+			"path": ".."
+		}
+	],
+	"settings": {
+		"python-envs.pythonProjects": []
+	}
+}
