@@ -1,5 +1,5 @@
-from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy.orm import DeclarativeBase
+from flask_sqlalchemy import SQLAlchemy
 import json
 from datetime import datetime
 
