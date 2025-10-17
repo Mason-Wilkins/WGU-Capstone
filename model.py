@@ -1,168 +1,89 @@
 from flask_sqlalchemy import SQLAlchemy
-from flask import Flask
+from sqlalchemy.orm import DeclarativeBase
 import json
 from datetime import datetime
 
-db = SQLAlchemy()
+class Base(DeclarativeBase):
+    pass
 
-class User(db.Model):
-    """Model for User class."""
+db = SQLAlchemy(model_class=Base)
+
+class Stock(db.Model):
+    """Model for Stock class."""
     
-    __tablename__ = "users"
-    # table name is users
+    __tablename__ = "stocks"
     
-    user_id = db.Column(db.Integer, primary_key=True, autoincrement=True, nullable=False)
-    fname = db.Column(db.String, nullable=False)
-    lname = db.Column(db.String, nullable=False)
-    email = db.Column(db.String, nullable=False)
-    username = db.Column(db.String, nullable=False)
-    password = db.Column(db.String, nullable=False)
-    phone = db.Column(db.Integer)
+    stock_id = db.Column(db.Integer, primary_key=True, autoincrement=True, nullable=False)
+    record_id = db.Column(db.String, unique=True, nullable=False)
+    ticker = db.Column(db.String, nullable=False)
+    date = db.Column(db.DateTime, nullable=False)
+    open_price = db.Column(db.Float)
+    high_price = db.Column(db.Float)
+    low_price = db.Column(db.Float)
+    close_price = db.Column(db.Float)
+    adj_close_price = db.Column(db.Float)
+    volume = db.Column(db.Integer)
     created_at = db.Column(db.DateTime, default=datetime.now(tz=None))
-
-    favorites = db.relationship('Favorite', back_populates='users')
-    reviews = db.relationship('Review', back_populates='users')
-    images = db.relationship('Images', back_populates='users')
-    
-    #many-to-one relationship  favorites table
     
     def __repr__(self):
-        """Show info for User class."""
+        """Show info for Stock class."""
         
         return f"""
-        <User ID = {self.user_id}
-        First Name = {self.fname}
-        Last Name = {self.lname}
-        Email = {self.email}
-        Username = {self.username}
-        Password = {self.password}
-        Phone = {self.phone}
+        <Stock ID = {self.stock_id}
+        Record ID = {self.record_id}
+        Ticker = {self.ticker}
+        Date = {self.date}
+        Open Price = {self.open_price}
+        High Price = {self.high_price}
+        Low Price = {self.low_price}
+        Close Price = {self.close_price}
+        Adj Close Price = {self.adj_close_price}
+        Volume = {self.volume}
+        Created At = {self.created_at}
+        >
+        """
+    
+class Ticker(db.Model):
+    """Model for Ticker class."""
+    
+    __tablename__ = "tickers"
+    
+    ticker_id = db.Column(db.Integer, primary_key=True, autoincrement=True, nullable=False)
+    ticker = db.Column(db.String, unique=True, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.now(tz=None))
+    market = db.Column(db.String)
+    currency_name = db.Column(db.String)
+    locale = db.Column(db.String)
+    name = db.Column(db.String)
+    primary_exchange = db.Column(db.String)
+    type = db.Column(db.String)
+    active = db.Column(db.Boolean)
+    cik = db.Column(db.String)
+    composite_figi = db.Column(db.String)
+    share_class_figi = db.Column(db.String)
+    last_updated_utc = db.Column(db.DateTime)
+    
+    def __repr__(self):
+        """Show info for Ticker class."""
+        
+        return f"""
+        <Ticker ID = {self.ticker_id}
+        Ticker = {self.ticker}
+        Created At = {self.created_at}
         >
         """
 
-     
-class Review(db.Model):
-    """Model foe Review class"""
-    
-    __tablename__ = "reviews"
-    
-    review_id = db.Column(db.Integer, primary_key=True, autoincrement=True, nullable=False)
-    user_id = db.Column(db.Integer, db.ForeignKey("users.user_id"), nullable=False)
-    trail_id = db.Column(db.Integer, db.ForeignKey("trails.trail_id"), nullable=False)
-    num_stars = db.Column(db.Integer)
-    review_text = db.Column(db.String)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow())
-    
-    users = db.relationship("User", back_populates="reviews")
-    trails = db.relationship("Trail", back_populates="reviews")
-    
-    
-    def __repr__(self):
-        """Show info aboue Review class"""
-        
-        return f"""review_id:{self.review_id},user_id: {self.user_id},trail_id:{self.trail_id},num_stars:{self.num_stars},review_text:{self.review_text}>"""
-        
+def connect_to_db(app, db_name):
+    app.config["SQLALCHEMY_DATABASE_URI"] = f"postgresql:///{db_name}"
+    app.config["SQLALCHEMY_ECHO"] = True
+    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-class Trail(db.Model):
-    """Model for Property class."""
-    
-    __tablename__ = "trails"
-    
-    trail_id = db.Column(db.Integer, primary_key=True, nullable=False)
-    name = db.Column(db.String, nullable=True)
-    area_name = db.Column(db.String, nullable=True)
-    city_name = db.Column(db.String, nullable=False)
-    state_name = db.Column(db.String, nullable=False)
-    country_name = db.Column(db.String, nullable=True)
-    _geoloc = db.Column(db.String, nullable=False)
-    popularity = db.Column(db.Float, nullable=True)
-    length = db.Column(db.Float, nullable=False)
-    elevation_gain = db.Column(db.Float, nullable=True)
-    difficulty_rating = db.Column(db.Integer, nullable=False)
-    route_type = db.Column(db.String, nullable=False)
-    visitor_usage = db.Column(db.String, nullable=True)
-    avg_rating = db.Column(db.Float, nullable=True)
-    num_reviews = db.Column(db.Integer, nullable=True)
-    features = db.Column(db.String, nullable=True)
-    activities = db.Column(db.String, nullable=True)
-
-    favorites = db.relationship("Favorite", back_populates="trails")
-    reviews = db.relationship("Review", back_populates="trails")
-    images = db.relationship("Images", back_populates="trails")
-
-    
-    def __repr__(self):
-        """Show info about trail class."""
-        
-        return f"""
-        Trail ID: {self.trail_id}
-        Trail Name: {self.name}
-        Area Name: {self.area_name}
-        City Name: {self.city_name}
-        State Name: {self.state_name}
-        Country Name: {self.country_name}
-        Geolocation: {self._geoloc}
-        Popularity: {self.popularity}
-        Trail Length: {self.length}
-        Elevation gain: {self.elevation_gain}
-        Difficulty Rating: {self.difficulty_rating}
-        Route Type: {self.route_type}
-        Visitor Usage: {self.visitor_usage}
-        Average Rating: {self.avg_rating}
-        Number of Reviews: {self.num_reviews}
-        Features: {self.features}
-        """
-        
-        
-class Favorite(db.Model):
-    
-    __tablename__ = "favorites"
-    
-    favorite_id = db.Column(db.Integer, primary_key=True, autoincrement=True, nullable=False)
-    user_id = db.Column(db.Integer, db.ForeignKey('users.user_id'), nullable=False)
-    trail_id = db.Column(db.Integer, db.ForeignKey('trails.trail_id'), nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow())
-    
-    users = db.relationship("User", back_populates="favorites")
-    trails = db.relationship("Trail", back_populates="favorites")
-    
-    
-    
-    def __repr__(self):
-        """Returns info aboue Favorite class."""
-        
-        return f"""
-            <Favorite ID: {self.favorite_id}
-            User ID: {self.user_id}
-            Trail ID: {self.trail_id}>
-            """ 
-            
-
-class Images(db.Model):
-    """Model for TrailImages class"""
-    
-    __tablename__ = "images"
-    
-    image_id = db.Column(db.Integer, primary_key=True, autoincrement=True, nullable=False)
-    image_url = db.Column(db.String, nullable=False)
-    trail_id = db.Column(db.Integer, db.ForeignKey("trails.trail_id"), nullable=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('users.user_id'), nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.now(tz=None))
-    
-    users = db.relationship("User", back_populates="images")
-    trails = db.relationship("Trail", back_populates="images")
-
-
-def connect_to_db(flask_app, db_uri=None, echo=True):
-    flask_app.config["SQLALCHEMY_DATABASE_URI"] = db_uri
-    flask_app.config["SQLALCHEMY_ECHO"] = echo
-    flask_app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-
-    # db.app = flask_app
-    db.init_app(flask_app)
-
+    # Initialize the db instance with the app
+    db.init_app(app)
+    # db.create_all()
+    print("Connected to the db!")
 
 
 if __name__ == "__main__":
     from server import app
-    connect_to_db(app)
+    connect_to_db(app, "stocks")
