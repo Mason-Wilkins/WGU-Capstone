@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from model import db, Stock, connect_to_db
 from kmeans import KMeans
 from ctx import with_app_context
-import time
+import datetime
 
 def ensure_tickers():
     url = "ftp://ftp.nasdaqtrader.com/SymbolDirectory/nasdaqlisted.txt"
@@ -50,12 +50,12 @@ def normalize_stock(stock_df, tickers):
     return stock_df
 
 @with_app_context
-def populate_stocks():
+def populate_all_stocks():
     ensure_tickers()
+    db.create_all()
     tickers = pd.read_csv("tickers.csv").values.flatten().tolist()
     j = 0
-    for i in range(len(tickers)-1):
-        ticker = tickers[i][0]
+    for ticker in tickers:
         print(f"Fetching data for {ticker}")
         ticker_obj = yf.Ticker(ticker)
         ticker_in_db = (
@@ -64,22 +64,78 @@ def populate_stocks():
             .order_by(Stock.date.desc())
             .first()
         )
+        today = datetime.date.today().strftime("%Y-%m-%d")
         if ticker_in_db:
-            historical_data = ticker_obj.history(start=ticker_in_db.date, interval="1d", auto_adjust=True)
+            historical_data = ticker_obj.history(start=ticker_in_db.date, end=today, interval="1d", auto_adjust=True)
         else:
-            historical_data = ticker_obj.history(period="1y", interval="1d", auto_adjust=True)
+            historical_data = ticker_obj.history(start="2022-10-01", end=today, interval="1d", auto_adjust=True)
         # historical_data = ticker_obj.history(period="1y", interval="1d", auto_adjust=True)
         # stock = yf.download(ticker, period="10d", interval="1d", auto_adjust=True)
         if historical_data is None or historical_data.empty:
             continue
-        historical_data.infer_objects()
-        print(historical_data.info())
         for date, row in historical_data.iterrows():
-            print("Sleeping for one second")
-            time.sleep(1)
+            # Convert from pandas datatypes to python datatypes for db storage
+            record_id = f"{ticker}-{date.strftime('%Y%m%d')}"
+            ticker_data_in_db = (
+                db.session.query(Stock)
+                .filter(Stock.record_id == record_id)
+                .first()
+            )
+            if ticker_data_in_db:
+                continue
+            row = row.astype(object)
+            s = Stock(
+                record_id = f"{ticker}-{date.strftime('%Y%m%d')}",
+                ticker = ticker,
+                date = date.to_pydatetime(),
+                open_price = row["Open"],
+                high_price = row["High"],
+                low_price = row["Low"],
+                close_price = row["Close"],
+                volume = int(row["Volume"])
+            )
+            db.session.add(s)
+            db.session.commit()
+
+    print("✅ Stock data population complete.")
+
+@with_app_context
+def populate_recent_stocks():
+    ensure_tickers()
+    db.create_all()
+    tickers = pd.read_csv("tickers.csv").values.flatten().tolist()
+    for ticker in tickers:
+        print(f"Fetching data for {ticker}")
+        ticker_obj = yf.Ticker(ticker)
+        ticker_in_db = (
+            db.session.query(Stock)
+            .filter(Stock.ticker == ticker)
+            .order_by(Stock.date.desc())
+            .first()
+        )
+        today = datetime.date.today().strftime("%Y-%m-%d")
+        # if ticker_in_db:
+        #     historical_data = ticker_obj.history(start=ticker_in_db.date, end=today, interval="1d", auto_adjust=True)
+        # else:
+        historical_data = ticker_obj.history(start="2022-10-01", end=today, interval="1d", auto_adjust=True)
+        # historical_data = ticker_obj.history(period="1y", interval="1d", auto_adjust=True)
+        # stock = yf.download(ticker, period="10d", interval="1d", auto_adjust=True)
+        if historical_data is None or historical_data.empty:
+            continue
+        # historical_data.infer_objects()
+        for date, row in historical_data.iterrows():
+            # print("Sleeping for one second")
+            # time.sleep(1)
+            record_id = f"{ticker}-{date.strftime('%Y%m%d')}"
+            ticker_data_in_db = (
+                db.session.query(Stock)
+                .filter(Stock.record_id == record_id)
+                .first()
+            )
+            if ticker_data_in_db:
+                continue
             # Convert from pandas datatypes to python datatypes for db storage
             row = row.astype(object)
-            record_id = f"{ticker}-{date.strftime('%Y%m%d')}"
             db_record_id = db.session.query(Stock).filter(Stock.record_id == record_id).first()
             if db_record_id:
                 continue
@@ -111,7 +167,6 @@ def test_stock_data():
         ticker_obj = yf.Ticker(ticker)
         historical_data = ticker_obj.history(period="10d", interval="1d", auto_adjust=True)
         stock = yf.download(ticker, period="10d", interval="1d", auto_adjust=True)
-        # print(normalize_stock(stock, ticker))
         print(historical_data.index)
         print(historical_data.columns)
         print(historical_data.shape)
