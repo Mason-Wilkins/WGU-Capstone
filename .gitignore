@@ -1,9 +1,36 @@
+# =========================
+# ENVIRONMENT & SECRETS
+# =========================
 secrets.sh
-env
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# =========================
+# PYTHON
+# =========================
 __pycache__/
 
-# Logs
-logs
+# =========================
+# NODE / FRONTEND
+# =========================
+node_modules/
+dist/
+dist-ssr/
+build/
+*.local
+
+# =========================
+# TESTING
+# =========================
+coverage/
+
+# =========================
+# LOGS
+# =========================
+logs/
 *.log
 npm-debug.log*
 yarn-debug.log*
@@ -11,15 +38,12 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
-node_modules
-dist
-dist-ssr
-*.local
-
-# Editor directories and files
-.vscode/*
+# =========================
+# EDITORS & SYSTEM FILES
+# =========================
+.vscode/
 !.vscode/extensions.json
-.idea
+.idea/
 .DS_Store
 *.suo
 *.ntvs*
@@ -27,29 +51,18 @@ dist-ssr
 *.sln
 *.sw?
 
-react-with-flask/*
-node_modules/
-
-# dependencies
-/node_modules
-/.pnp
+# =========================
+# DEPENDENCY MANAGERS
+# =========================
+.pnp
 .pnp.js
 
-# testing
-/coverage
+# =========================
+# PROJECT SPECIFIC
+# =========================
+react-with-flask/
 
-# production
-/build
-
-# misc
-.DS_Store
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
-
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
+# =========================
+# DATABASE / MISC
+# =========================
 *.sql
