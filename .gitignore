@@ -2,11 +2,11 @@
 # ENVIRONMENT & SECRETS
 # =========================
 secrets.sh
-.env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
+env/*
+env.local
+env.development.local
+env.test.local
+env.production.local
 
 # =========================
 # PYTHON

@@ -1,299 +1,424 @@
-import yfinance as yf
+# --- add near top of crud.py (or keep your existing ones) ---
+import os, subprocess, threading, requests, datetime as dt, zipfile
 import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-from kmeans import KMeans
-from ctx import with_app_context
-import datetime, os, subprocess, threading, math
 
-def download_stocks_data(populate_db=False):
-    if not os.path.exists("stocks.sql"):
-        os.system('curl -L -o stocks.sql "https://drive.usercontent.google.com/download?export=download&id=1_d8Ivcjw5WsGcUyR8C9d6Uyi-OwPumN3&confirm=t"')
-    elif populate_db:
-        os.system('dropdb stocks')
-        os.system('createdb stocks')
-        subprocess.run(
-            [
-                "psql",
-                "--set", "ON_ERROR_STOP=1",
-                "--dbname", "postgresql:///stocks",
-                "--file", "stocks.sql"
-            ]
-            ,check=True
-        )
-    else:
-        print("stocks.sql already exists. Skipping download.")
+from model import db, Stock, Ticker
+from ctx import with_app_context
+from sqlalchemy import or_, case, exists, func
 
 def ensure_tickers():
-    url = "ftp://ftp.nasdaqtrader.com/SymbolDirectory/nasdaqlisted.txt"
-    nasdaq = pd.read_csv(url, sep="|")
-    tickers = nasdaq["Symbol"].tolist()
-    tickers_csv = pd.read_csv("tickers.csv")
-    if tickers_csv is None or tickers_csv.empty:
+    """Create a tickers.csv from NASDAQ list if not present."""
+    if not os.path.exists("tickers.csv"):
+        url = "ftp://ftp.nasdaqtrader.com/SymbolDirectory/nasdaqlisted.txt"
+        nasdaq = pd.read_csv(url, sep="|")
+        tickers = [str(t).strip() for t in nasdaq["Symbol"].tolist() if str(t).strip() != "nan"]
         with open("tickers.csv", "w") as f:
             for t in tickers:
-                t = str(t).strip()
-                if t == 'nan':
-                    continue
-                if len(t) > 5:
-                    break
-                f.write(t + "\n")
+                # keep it reasonable
+                if len(t) <= 5:
+                    f.write(t + "\n")
 
-def chunk(lst, n):
-    size = math.ceil(len(lst) / n)
-    for i in range(0, len(lst), size):
-        yield lst[i:i+size]
-
-def fetch_and_store_batch(tickers_chunk):
+@with_app_context
+def populate_recent_stocks(days_back: int = 365) -> dict[str, int]:
     """
-    Runs INSIDE a thread. Creates its own app context and DB session.
+    Incrementally backfill per ticker using yfinance (single-thread).
+    For each Ticker in DB, fetch candles from (last_date+1) -> today.
     """
-    from model import app, db, Stock  # import inside to avoid circulars; adjust path
+    _mark("populate_recent_stocks: start")
+    session = db.session
 
-    # Each thread needs an app context for Flask-SQLAlchemy's scoped_session
-    with app.app_context():
-        session = db.create_scoped_session()  # thread-local session
+    # Prefer Ticker table; if empty, fall back to distinct symbols from Stock
+    tickers = [t.ticker for t in session.query(Ticker.ticker).all()]
+    if not tickers:
+        tickers = [t[0] for t in session.query(Stock.ticker).distinct().all()]
+
+    if not tickers:
+        _mark("populate_recent_stocks: no tickers found in DB")
+        return {"tickers": 0, "inserted": 0}
+
+    inserted_total = 0
+    today = dt.datetime.utcnow()
+
+    for sym in tickers:
+        sym = (sym or "").strip().upper()
+        if not sym:
+            continue
+
         try:
-            today = datetime.date.today().strftime("%Y-%m-%d")
-            # Process each ticker in this chunk
-            for ticker in tickers_chunk:
-                t = yf.Ticker(ticker)
+            last_date = (
+                session.query(func.max(Stock.date))
+                .filter(Stock.ticker == sym)
+                .scalar()
+            )
+            start = (last_date + dt.timedelta(days=1)) if last_date else (today - dt.timedelta(days=days_back))
+            if start >= today:
+                continue
 
-                # Find last date we have
-                last = (
-                    session.query(Stock)
-                    .filter(Stock.ticker == ticker)
-                    .order_by(Stock.date.desc())
-                    .first()
-                )
-                start = last.date.strftime("%Y-%m-%d") if last else "2022-10-01"
+            df = yf.download(sym, start=start, end=today, interval="1d", progress=False, threads=False, auto_adjust=True)
+            if df is None or df.empty:
+                continue
 
-                hist = t.history(start=start, end=today, interval="1d", auto_adjust=True)
-                if hist is None or hist.empty:
+            new_rows = []
+            for idx, row in df.iterrows():
+                # idx may be pandas Timestamp (tz-aware sometimes), normalize to naive UTC
+                ts = dt.datetime.utcfromtimestamp(idx.timestamp()) if hasattr(idx, "timestamp") else idx
+                record_id = f"{sym}-{ts.strftime('%Y%m%d')}"
+                # upsert guard
+                exists = session.query(Stock).filter(Stock.record_id == record_id).first()
+                if exists:
                     continue
+                new_rows.append(Stock(
+                    record_id=record_id,
+                    ticker=sym,
+                    date=ts,
+                    open_price=float(row.get("Open", 0.0)) if row.get("Open", None) is not None else None,
+                    high_price=float(row.get("High", 0.0)) if row.get("High", None) is not None else None,
+                    low_price=float(row.get("Low", 0.0)) if row.get("Low", None) is not None else None,
+                    close_price=float(row.get("Close", 0.0)) if row.get("Close", None) is not None else None,
+                    adj_close_price=float(row.get("Adj Close", 0.0)) if row.get("Adj Close", None) is not None else None,
+                    volume=int(row.get("Volume", 0)) if row.get("Volume", None) is not None else None,
+                    created_at=dt.datetime.utcnow(),
+                ))
 
-                # Build rows, commit in batches for speed
-                to_insert = []
-                for date, row in hist.iterrows():  # use itertuples() if you like
-                    record_id = f"{ticker}-{date.strftime('%Y%m%d')}"
-                    # optimistic insert; let UNIQUE(record_id) prevent dupes
-                    s = Stock(
-                        record_id=record_id,
-                        ticker=ticker,
-                        date=date.to_pydatetime(),
-                        open_price=float(row["Open"]),
-                        high_price=float(row["High"]),
-                        low_price=float(row["Low"]),
-                        close_price=float(row["Close"]),
-                        volume=int(row["Volume"]),
-                    )
-                    to_insert.append(s)
+            if new_rows:
+                session.bulk_save_objects(new_rows)
+                session.commit()
+                inserted_total += len(new_rows)
+                _mark(f"{sym}: inserted {len(new_rows)} rows")
 
-                # Bulk-ish insert with conflict handling (Postgres example below)
-                if to_insert:
-                    session.add_all(to_insert)
-                    # For Postgres, prefer "ON CONFLICT DO NOTHING" to avoid races:
-                    # session.flush() with ORM upsert requires SQLAlchemy 2.0 + insert(Stock).on_conflict_do_nothing()
-                    session.commit()
-        except Exception:
+        except Exception as e:
             session.rollback()
-            raise
-        finally:
-            session.close()
+            _mark(f"{sym}: error {e}")
 
-def multithread_stock_population(max_workers=4):
-    from model import app, db  # adjust path
-    with app.app_context(): 
-        ensure_tickers()
-        db.create_all()
-        tickers = pd.read_csv("tickers.csv").values.flatten().tolist()
-
-    # Split work so threads don't step on each other
-    chunks = list(chunk(tickers, max_workers))
-
-    # Run threads; each will create its own app context/session
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = [ex.submit(fetch_and_store_batch, ch) for ch in chunks]
-        for f in as_completed(futures):
-            f.result()  # will raise if thread failed
-
-    print("✅ Multithreaded stock data population complete.")
-
-
-@with_app_context
-def multithread_stock_population():
-    thread1 = threading.Thread(target=populate_recent_stocks)
-    thread2 = threading.Thread(target=populate_recent_stocks)
-    thread3 = threading.Thread(target=populate_recent_stocks)
-    thread1.start()
-    thread2.start()
-    thread3.start()
-    thread1.join()
-    thread2.join()
-    thread3.join()
-    print("✅ Multithreaded stock data population complete.")
-
-@with_app_context
-def populate_all_stocks():
-    ensure_tickers()
-    db.create_all()
-    tickers = pd.read_csv("tickers.csv").values.flatten().tolist()
-    for ticker in tickers:
-        print(f"Fetching data for {ticker}")
-        ticker_obj = yf.Ticker(ticker)
-        ticker_in_db = (
-            db.session.query(Stock)
-            .filter(Stock.ticker == ticker)
-            .order_by(Stock.date.desc())
-            .first()
-        )
-        today = datetime.date.today().strftime("%Y-%m-%d")
-        if ticker_in_db:
-            historical_data = ticker_obj.history(start=ticker_in_db.date, end=today, interval="1d", auto_adjust=True)
-        else:
-            historical_data = ticker_obj.history(start="2022-10-01", end=today, interval="1d", auto_adjust=True)
-        # historical_data = ticker_obj.history(period="1y", interval="1d", auto_adjust=True)
-        # stock = yf.download(ticker, period="10d", interval="1d", auto_adjust=True)
-        if historical_data is None or historical_data.empty:
-            continue
-        for date, row in historical_data.iterrows():
-            # Convert from pandas datatypes to python datatypes for db storage
-            record_id = f"{ticker}-{date.strftime('%Y%m%d')}"
-            ticker_data_in_db = (
-                db.session.query(Stock)
-                .filter(Stock.record_id == record_id)
-                .first()
-            )
-            if ticker_data_in_db:
-                continue
-            row = row.astype(object)
-            s = Stock(
-                record_id = f"{ticker}-{date.strftime('%Y%m%d')}",
-                ticker = ticker,
-                date = date.to_pydatetime(),
-                open_price = row["Open"],
-                high_price = row["High"],
-                low_price = row["Low"],
-                close_price = row["Close"],
-                volume = int(row["Volume"])
-            )
-            db.session.add(s)
-            db.session.commit()
-
+    _mark(f"populate_recent_stocks: done, inserted={inserted_total}")
     print("✅ Stock data population complete.")
+    return {"tickers": len(tickers), "inserted": inserted_total}
+
+
+
+# ======= status helpers (reuse if you already have them) =======
+_population_status = {
+    "started": False,
+    "finished": False,
+    "error": None,
+    "steps": [],
+    "started_at": None,
+    "finished_at": None,
+}
+
+def _now_utc_iso():
+    return dt.datetime.utcnow().isoformat()
+
+def _mark(msg: str):
+    _population_status["steps"].append(msg)
+    # keep steps list bounded
+    if len(_population_status["steps"]) > 200:
+        _population_status["steps"] = _population_status["steps"][-200:]
 
 @with_app_context
-def populate_recent_stocks():
-    tickers = pd.read_csv("tickers.csv").values.flatten().tolist()
-    for ticker in tickers:
-        print(f"Fetching data for {ticker}")
-        ticker_obj = yf.Ticker(ticker)
-        ticker_in_db = (
-            db.session.query(Stock)
-            .filter(Stock.ticker == ticker)
-            .order_by(Stock.date.desc())
-            .first()
+def get_population_status():
+    """Add live counts safely."""
+    try:
+        stock_rows = db.session.query(Stock).count()
+        stocks_distinct = db.session.query(Stock.ticker).distinct().count()
+        tickers_rows = db.session.query(Ticker).count()
+    except Exception as e:
+        stock_rows = stocks_distinct = tickers_rows = 0
+        _population_status["error"] = _population_status.get("error") or repr(e)
+
+    return {
+        **_population_status,
+        "stock_rows": stock_rows,
+        "stocks_distinct_tickers": stocks_distinct,
+        "tickers_rows": tickers_rows,
+    }
+
+# ======= Kaggle fetch & populate =======
+
+def _ensure_kaggle_auth_ready():
+    """
+    Best-effort check that kaggle CLI can run with a valid kaggle.json.
+    Raises if 'kaggle' CLI not found; warns (marks) if config is missing.
+    """
+    try:
+        # Will raise if binary missing
+        subprocess.run(["kaggle", "--version"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except Exception as e:
+        raise RuntimeError("Kaggle CLI not found. Install with `pip install kaggle` and place kaggle.json in ~/.kaggle/") from e
+
+    # Check for kaggle.json
+    kaggle_dir = os.environ.get("KAGGLE_CONFIG_DIR", os.path.expanduser("~/.kaggle"))
+    cred = os.path.join(kaggle_dir, "kaggle.json")
+    if not os.path.exists(cred):
+        _mark("WARNING: ~/.kaggle/kaggle.json not found — Kaggle download will fail.")
+
+def fetch_latest_kaggle_dataset(output_dir="./data") -> str:
+    """
+    Downloads and extracts the latest stock-market-dataset from Kaggle
+    into the current relative directory (default ./data).
+
+    No Kaggle CLI or authentication required.
+    Returns the path to symbols_valid_meta.csv if found.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    kaggle_zip_url = (
+        "https://www.kaggle.com/api/v1/datasets/download/"
+        "jacksoncrow/stock-market-dataset"
+    )
+    zip_path = os.path.join(output_dir, "stock-market-dataset.zip")
+
+    print("📦 Downloading dataset from Kaggle (no auth)...")
+    resp = requests.get(kaggle_zip_url, stream=True)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Download failed: {resp.status_code} — Kaggle may require login.")
+    with open(zip_path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=8192):
+            f.write(chunk)
+    print(f"✅ Downloaded to {zip_path}")
+
+    print("📂 Extracting ZIP...")
+    with zipfile.ZipFile(zip_path, "r") as zip_ref:
+        # Filter out unwanted directories
+        members = [
+            m for m in zip_ref.namelist()
+            if not (m.startswith("etfs/") or m.startswith("stocks/"))
+        ]
+        zip_ref.extractall(output_dir, members)
+    os.remove(zip_path)
+
+    # Find relevant CSV
+    candidates = [
+        os.path.join(output_dir, "symbols_valid_meta.csv"),
+        os.path.join(output_dir, "symbols.csv"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            print(f"✅ Found symbols CSV: {p}")
+            return p
+    raise FileNotFoundError("symbols_valid_meta.csv not found after extraction.")
+
+@with_app_context
+def populate_tickers_from_kaggle(csv_path: str, *, verify_in_stocks: bool = True, chunk_size: int = 1000) -> dict:
+    """
+    Populate `Ticker` table from Kaggle symbols CSV.
+    - If verify_in_stocks=True, only insert symbols that already exist in `stocks` table.
+    Returns a summary dict.
+    """
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(csv_path)
+
+    _mark(f"Loading symbols from {csv_path}")
+    df = pd.read_csv(csv_path)
+
+    # Column normalization (dataset uses 'Symbol' and 'Security Name')
+    # Fallbacks for robustness.
+    sym_col = None
+    for c in ["Symbol", "symbol", "Ticker", "ticker"]:
+        if c in df.columns:
+            sym_col = c; break
+    if sym_col is None:
+        raise ValueError(f"No symbol column found in {csv_path}")
+
+    name_col = None
+    for c in ["Security Name", "Name", "companyName", "company_name"]:
+        if c in df.columns:
+            name_col = c; break
+
+    # Build symbol -> name
+    raw = df[[sym_col] + ([name_col] if name_col else [])].dropna(subset=[sym_col])
+    raw[sym_col] = raw[sym_col].astype(str).str.upper().str.strip()
+    # Basic filter: avoid clearly invalid rows
+    raw = raw[(raw[sym_col] != "") & (~raw[sym_col].str.contains(r"\s", regex=True))]
+
+    symbols_all = raw[sym_col].unique().tolist()
+    _mark(f"Kaggle symbols loaded: {len(symbols_all)}")
+
+    # Restrict to symbols actually present in prices, if requested
+    if verify_in_stocks:
+        present_rows = db.session.query(Stock.ticker).filter(Stock.ticker.in_(symbols_all)).distinct().all()
+        symbols = sorted({r[0].upper() for r in present_rows})
+        _mark(f"Symbols verified present in stocks: {len(symbols)}")
+    else:
+        symbols = symbols_all
+
+    # Already in Ticker?
+    existing_rows = db.session.query(Ticker.ticker).filter(Ticker.ticker.in_(symbols)).all()
+    existing = {r[0].upper() for r in existing_rows}
+    to_insert = [s for s in symbols if s not in existing]
+
+    inserted = 0
+    batch = []
+
+    def flush():
+        nonlocal inserted, batch
+        if not batch:
+            return
+        db.session.add_all(batch)
+        db.session.commit()
+        inserted += len(batch)
+        batch = []
+
+    # Optional name mapping
+    name_map = {}
+    if name_col:
+        sub = raw[[sym_col, name_col]].drop_duplicates()
+        name_map = {r[sym_col]: r[name_col] for _, r in sub.iterrows()}
+
+    _mark(f"Inserting {len(to_insert)} new tickers")
+    for sym in to_insert:
+        batch.append(Ticker(
+            ticker=sym,
+            name=name_map.get(sym),
+            active=True,
+            created_at=dt.datetime.utcnow(),
+        ))
+        if len(batch) >= chunk_size:
+            flush()
+    flush()
+
+    return {
+        "kaggle_symbols_total": len(symbols_all),
+        "considered": len(symbols),
+        "already_present": len(existing),
+        "inserted": inserted,
+        "verify_in_stocks": verify_in_stocks,
+    }
+
+# ======= Startup: integrate Kaggle + your existing price population =======
+
+@with_app_context
+def kickoff_background_population(
+    *,
+    verify_in_stocks: bool = True,   # only add tickers that already have price rows
+    enrich_names: bool = True,       # kept for API compatibility; Kaggle already includes names
+    use_batched_prices: bool = True, # call your faster price loader if you have it
+    batch_size: int = 64,            # batch size for your batched loader
+):
+    """
+    Non-blocking startup population:
+    1) Fetch Kaggle dataset (symbols_valid_meta.csv)
+    2) Populate Ticker table (optionally verifying presence in Stocks)
+    3) Populate prices (using your existing functions)
+    """
+    def _run():
+        _population_status.update({
+            "started": True,
+            "finished": False,
+            "error": None,
+            "steps": [],
+            "started_at": _now_utc_iso(),
+            "finished_at": None,
+        })
+        try:
+            # 1) Kaggle download
+            _mark("Kaggle: download latest stock-market-dataset")
+            csv_path = fetch_latest_kaggle_dataset(output_dir="./data")
+
+            # 2) Populate tickers from Kaggle
+            _mark(f"Kaggle: populate tickers (verify_in_stocks={verify_in_stocks})")
+            summary_tickers = populate_tickers_from_kaggle(csv_path, verify_in_stocks=verify_in_stocks)
+            _mark(f"tickers summary: {summary_tickers}")
+
+            # 3) Populate/refresh prices using your existing code paths.
+            #    If you have populate_stocks_yf_batched(...) use it; otherwise fallback to populate_recent_stocks().
+            try:
+                from crud import populate_stocks_yf_batched  # only if you implemented it
+                has_batched = True
+            except Exception:
+                has_batched = False
+
+            if use_batched_prices and has_batched:
+                _mark(f"populate stocks (batched yf.download, batch_size={batch_size})")
+                prices_summary = populate_stocks_yf_batched(batch_size=batch_size)
+            else:
+                _mark("populate stocks (incremental yfinance)")
+                prices_summary = populate_recent_stocks()
+
+            _mark(f"prices summary: {prices_summary}")
+
+            _population_status["finished"] = True
+            _population_status["finished_at"] = _now_utc_iso()
+            _mark("done")
+        except Exception as e:
+            _population_status["error"] = repr(e)
+            _population_status["finished"] = True
+            _population_status["finished_at"] = _now_utc_iso()
+
+    t = threading.Thread(target=_run, daemon=True, name="startup-populate")
+    t.start()
+    return True
+
+def _coerce_limit(raw, default=12, lo=1, hi=50):
+    try:
+        n = int(raw)
+    except Exception:
+        n = default
+    return max(lo, min(hi, n))
+
+def _norm_q(q: str) -> str:
+    return (q or "").strip()
+
+def _like_pattern_contains(q: str) -> str:
+    return f"%{q}%"
+
+def _like_pattern_prefix(q: str) -> str:
+    return f"{q}%"
+
+def _base_ticker_query():
+    return db.session.query(
+        Ticker.ticker.label("symbol"),
+        Ticker.name.label("name"),
+    )
+
+def suggest_tickers(
+    q: str,
+    *,
+    limit: int = 12,
+    require_in_stocks: bool = True,
+    include_inactive: bool = False,
+):
+    """
+    Return a list[ {symbol, name} ] for search suggestions.
+
+    - q: user query (ticker or company fragment), case-insensitive
+    - limit: 1..50 (default 12)
+    - require_in_stocks: only tickers that appear at least once in `stocks`
+    - include_inactive: include rows where Ticker.active == False
+    """
+    q = _norm_q(q)
+    if not q:
+        return []
+
+    limit = _coerce_limit(limit)
+
+    # case-insensitive patterns
+    pat_prefix = _like_pattern_prefix(q)
+    pat_contains = _like_pattern_contains(q)
+
+    # Base WHERE: match by ticker prefix first OR name contains
+    filters = [
+        or_(
+            Ticker.ticker.ilike(pat_prefix),         # prefix match on ticker
+            (Ticker.name.ilike(pat_contains) if Ticker.name is not None else False),
         )
-        today = datetime.date.today().strftime("%Y-%m-%d")
-        if ticker_in_db:
-            historical_data = ticker_obj.history(start=ticker_in_db.date, end=today, interval="1d", auto_adjust=True)
-        else:
-            historical_data = ticker_obj.history(start="2022-10-01", end=today, interval="1d", auto_adjust=True)
-        # historical_data = ticker_obj.history(period="1y", interval="1d", auto_adjust=True)
-        # stock = yf.download(ticker, period="10d", interval="1d", auto_adjust=True)
-        if historical_data is None or historical_data.empty:
-            continue
-        for date, row in historical_data.iterrows():
-            record_id = f"{ticker}-{date.strftime('%Y%m%d')}"
-            ticker_data_in_db = (
-                db.session.query(Stock)
-                .filter(Stock.record_id == record_id)
-                .first()
-            )
-            if ticker_data_in_db:
-                continue
-            # Convert from pandas datatypes to python datatypes for db storage
-            row = row.astype(object)
-            db_record_id = db.session.query(Stock).filter(Stock.record_id == record_id).first()
-            if db_record_id:
-                continue
-            s = Stock(
-                record_id = f"{ticker}-{date.strftime('%Y%m%d')}",
-                ticker = ticker,
-                date = date.to_pydatetime(),
-                open_price = row["Open"],
-                high_price = row["High"],
-                low_price = row["Low"],
-                close_price = row["Close"],
-                volume = int(row["Volume"])
-            )
-            db.session.add(s)
-            db.session.commit()
+    ]
 
-    print("✅ Stock data population complete.")
+    if not include_inactive:
+        filters.append(or_(Ticker.active.is_(True), Ticker.active.is_(None)))
 
-def test_stock_data():
-    dat = yf.Ticker("MSFT")
-    dat.info
-    ensure_tickers()
-    tickers = pd.read_csv("tickers.csv")
-    
-    data = {}
-    i = 0
-    for ticker in tickers:
-        # print(ticker)
-        ticker_obj = yf.Ticker(ticker)
-        historical_data = ticker_obj.history(period="10d", interval="1d", auto_adjust=True)
-        stock = yf.download(ticker, period="10d", interval="1d", auto_adjust=True)
-        if stock is None or stock.empty:
-            continue
-        data[ticker] = stock
-        if i == 2:
-            break
-        i+=1
+    query = _base_ticker_query().filter(*filters)
 
-    return data
+    if require_in_stocks:
+        # Only tickers that have at least one price row recorded
+        subq_exists = db.session.query(Stock.ticker).filter(Stock.ticker == Ticker.ticker).exists()
+        query = query.filter(subq_exists)
 
-def fit_data(data):
-    features = []
-    names = []
+    # Order: prioritize prefix ticker matches, then alphabetically
+    priority = case(
+        (Ticker.ticker.ilike(pat_prefix), 0),
+        else_=1,
+    )
+    query = query.order_by(priority.asc(), Ticker.ticker.asc()).limit(limit)
 
-    for t, df in data.items():
-        df["Return"] = df["Close"].pct_change()
-
-        avg_return = df["Return"].mean()
-        volatility = df["Return"].std()
-
-        # Skip if we can’t compute both numbers
-        if np.isnan(avg_return) or np.isnan(volatility):
-            print(f"Skipping {t} due to NaN values")
-            continue
-
-        features.append([avg_return, volatility])
-        names.append(t)
-
-    X = np.array(features)
-    print("Cleaned feature matrix:\n", X)
-    # Example: get data for first 5
-    # data = yf.download(tickers[:5], period="1d")
-    # print(data)
-    model = KMeans(n_clusters=3, max_iter=100)
-    model.fit(X)
-    labels = model.predict(X)
-    for stock, cluster in zip(names, labels):
-        print(f"{stock}: Cluster {cluster}")
-
-    # Compute score (return / volatility = Sharpe-like ratio)
-    scores = [r/v if v > 0 else -np.inf for r, v in X]
-
-    # Pick best stock
-    best_index = np.argmax(scores)
-    best_stock = names[best_index]
-
-    # Show all scores
-    print("\n=== Stock Scores ===")
-    for name, score, label in zip(names, scores, labels):
-        print(f"{name}: Score={score:.4f}, Cluster={label}")
-
-    print(f"\n✅ Best stock to pick: {best_stock}")
-    return best_stock
+    rows = query.all()
+    return [{"symbol": r.symbol, "name": r.name} for r in rows]

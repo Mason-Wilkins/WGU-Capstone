@@ -1,0 +1,778 @@
+// src/App.js
+import React, { useEffect, useMemo, useState } from "react";
+import {
+  LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid, Legend,
+  BarChart, Bar, ScatterChart, Scatter
+} from "recharts";
+import {
+  TrendingUp, Sparkles, Search, Loader2, CheckCircle, AlertTriangle
+} from "lucide-react";
+import "./App.css";
+
+// Normalize API base (strip trailing slashes). Default to local Flask dev server.
+const RAW_API_BASE = process.env.REACT_APP_API_BASE || "http://localhost:5000";
+const API_BASE = RAW_API_BASE.replace(/\/+$/, "");
+
+/* ================================
+   Feature engineering / wrangling
+   ================================ */
+
+function engineer(history) {
+  if (!Array.isArray(history) || history.length === 0) {
+    return {
+      enriched: [],
+      returnsSeries: [],
+      cumSeries: [],
+      volSeries: [],
+      momSeries: [],
+      mvScatter: [],
+      hasEnough: false,
+    };
+  }
+
+  const toNum = (x) => (typeof x === "number" ? x : Number(x));
+  const enriched = history.map((d) => ({
+    date: d.date,
+    close: toNum(d.close),
+    volume: toNum(d.volume),
+  }));
+
+  // simple moving average helper
+  const sma = (arr, w, key) => {
+    const out = new Array(arr.length).fill(null);
+    let sum = 0;
+    for (let i = 0; i < arr.length; i++) {
+      sum += arr[i][key];
+      if (i >= w) sum -= arr[i - w][key];
+      if (i >= w - 1) out[i] = sum / w;
+    }
+    return out;
+  };
+
+  // MA5 and MA20 (short- and medium-term)
+  const ma5 = sma(enriched, 5, "close");
+  const ma20 = sma(enriched, 20, "close");
+
+  // daily returns
+  const returns = new Array(enriched.length).fill(null);
+  for (let i = 1; i < enriched.length; i++) {
+    const prev = enriched[i - 1].close;
+    const cur = enriched[i].close;
+    returns[i] = prev ? (cur - prev) / prev : null;
+  }
+
+  // rolling mean and std (20-day)
+  const rolling = (arr, w) => {
+    const mean = new Array(arr.length).fill(null);
+    const stdev = new Array(arr.length).fill(null);
+    const buf = [];
+    for (let i = 0; i < arr.length; i++) {
+      const v = arr[i];
+      buf.push(typeof v === "number" && isFinite(v) ? v : null);
+      if (buf.length > w) buf.shift();
+      if (buf.length === w && buf.every((x) => typeof x === "number")) {
+        const m = buf.reduce((a, b) => a + b, 0) / w;
+        const sd = Math.sqrt(buf.reduce((a, b) => a + Math.pow(b - m, 2), 0) / w);
+        mean[i] = m;
+        stdev[i] = sd;
+      }
+    }
+    return { mean, stdev };
+  };
+  const { mean: mom20, stdev: vol20 } = rolling(returns, 20);
+
+  // cumulative return from first valid
+  const cumSeries = [];
+  let base = enriched.find((d) => typeof d.close === "number")?.close ?? null;
+  for (let i = 0; i < enriched.length; i++) {
+    const c = enriched[i].close;
+    cumSeries.push({
+      date: enriched[i].date,
+      cum: base && c ? c / base - 1 : null,
+    });
+  }
+
+  const enrichedWithMA = enriched.map((d, i) => ({
+    ...d,
+    ma5: ma5[i],
+    ma20: ma20[i],
+  }));
+
+  const returnsSeries = enriched.map((d, i) => ({ date: d.date, ret: returns[i] }));
+  const volSeries = enriched.map((d, i) => ({ date: d.date, vol20: vol20[i] }));
+  const momSeries = enriched.map((d, i) => ({ date: d.date, mom20: mom20[i] }));
+
+  // scatter: momentum vs volatility
+  const mvScatter = [];
+  for (let i = 0; i < enriched.length; i++) {
+    if (typeof vol20[i] === "number" && typeof mom20[i] === "number") {
+      mvScatter.push({ vol: vol20[i], mom: mom20[i], date: enriched[i].date });
+    }
+  }
+
+  return {
+    enriched: enrichedWithMA,
+    returnsSeries,
+    cumSeries,
+    volSeries,
+    momSeries,
+    mvScatter,
+    hasEnough: mvScatter.length > 0,
+  };
+}
+
+function buildHistogram(returnsSeries, bins = 20) {
+  const vals = (returnsSeries || [])
+    .map((d) => d.ret)
+    .filter((x) => typeof x === "number" && isFinite(x));
+  if (vals.length === 0) return { bars: [], domain: [0, 0] };
+
+  const min = Math.min(...vals);
+  const max = Math.max(...vals);
+  const width = (max - min) / bins || 1e-6;
+
+  const buckets = Array.from({ length: bins }, (_, i) => ({
+    x0: min + i * width,
+    x1: min + (i + 1) * width,
+    count: 0,
+  }));
+
+  for (const v of vals) {
+    let idx = Math.floor((v - min) / width);
+    if (idx >= bins) idx = bins - 1;
+    if (idx < 0) idx = 0;
+    buckets[idx].count += 1;
+  }
+
+  const bars = buckets.map((b) => ({
+    bin: `${(b.x0 * 100).toFixed(2)}% – ${(b.x1 * 100).toFixed(2)}%`,
+    mid: (b.x0 + b.x1) / 2,
+    count: b.count,
+  }));
+
+  return { bars, domain: [min, max] };
+}
+
+/* ================================
+   Main App
+   ================================ */
+
+export default function StockAdvisorDashboard() {
+  // text input (for ad-hoc symbol)
+  const [tickers, setTickers] = useState("");
+  // selected bubbles
+  const [selectedTickers, setSelectedTickers] = useState([]);
+
+  const [range, setRange] = useState("6mo");
+  const [selected, setSelected] = useState("");
+  const [history, setHistory] = useState([]);     // [{date, close, volume}]
+  const [predict, setPredict] = useState(null);   // { best, alternatives, regime }
+  const [recent, setRecent] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  // chart options
+  const [showMA5, setShowMA5] = useState(true);
+  const [showMA20, setShowMA20] = useState(true);
+  const [histBins, setHistBins] = useState(20);
+
+  // API health
+  const [apiHealth, setApiHealth] = useState({ ok: false, ms: null });
+
+  // suggestions
+  const [suggest, setSuggest] = useState([]);
+  const [showSuggest, setShowSuggest] = useState(false);
+  const [suggestLoading, setSuggestLoading] = useState(false);
+
+  /* ----- Load history for chart ----- */
+  const loadHistory = async (tkr) => {
+    if (!tkr) return;
+    const t0 = performance.now();
+    try {
+      setLoading(true);
+      setError("");
+      const qs = new URLSearchParams({ ticker: tkr.toUpperCase(), range }).toString();
+      const res = await fetch(`${API_BASE}/api/history?${qs}`);
+      const t1 = performance.now();
+      setApiHealth({ ok: res.ok, ms: Math.round(t1 - t0) });
+
+      if (!res.ok) throw new Error(`History fetch failed: ${res.status}`);
+      const data = await res.json();
+      if (!Array.isArray(data) || data.length === 0) {
+        setHistory([]);
+        setError(`No history returned for ${tkr}.`);
+        return;
+      }
+      setHistory(data);
+    } catch (e) {
+      const msg = e?.message || "Failed to load history.";
+      const maybeCORS = msg.includes("Failed to fetch") || msg.includes("TypeError");
+      setHistory([]);
+      setError(maybeCORS ? `${msg} — Is Flask running on ${API_BASE}? CORS configured for http://localhost:3000?` : msg);
+      setApiHealth({ ok: false, ms: null });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  /* ----- Run prescriptive endpoint ----- */
+  const runPredict = async () => {
+    // Merge bubbles + any ad-hoc text; unique & uppercase
+    const list = [...selectedTickers];
+    if (tickers.trim()) list.push(tickers.trim().toUpperCase());
+    const uniqueList = Array.from(new Set(list)).filter(Boolean);
+
+    if (uniqueList.length === 0) {
+      setError("Select or type at least one ticker.");
+      return;
+    }
+    try {
+      setLoading(true);
+      setError("");
+      const body = { tickers: uniqueList, k: 3, range };
+      const res = await fetch(`${API_BASE}/api/predict`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) throw new Error(`Predict failed: ${res.status}`);
+      const data = await res.json();
+      setPredict(data || null);
+
+      const bestTicker = data?.best?.ticker || "";
+      if (bestTicker) {
+        setSelected(bestTicker);
+        await loadHistory(bestTicker);
+      } else {
+        setSelected("");
+        setHistory([]);
+        const regime = data?.regime || "No best recommendation returned by API.";
+        const skipped = data?.debug?.skipped
+          ? ` Skipped: ${Object.entries(data.debug.skipped).map(([t, why]) => `${t}=${why}`).join(", ")}`
+          : "";
+        const windowing = data?.debug?.start
+          ? ` (window ${data.debug.start} → ${data.debug.end || "today"})`
+          : "";
+        setError(`${regime}.${skipped}${windowing}`);
+      }
+    } catch (e) {
+      const msg = e?.message || "Failed to run prediction.";
+      const maybeCORS = msg.includes("Failed to fetch") || msg.includes("TypeError");
+      setPredict(null);
+      setSelected("");
+      setHistory([]);
+      setError(maybeCORS ? `${msg} — Is Flask running on ${API_BASE}? CORS configured for http://localhost:3000?` : msg);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  /* ----- Recent predictions (monitoring) ----- */
+  const loadRecent = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/recent-predictions`);
+      if (!res.ok) return; // silently ignore
+      const data = await res.json();
+      if (Array.isArray(data)) setRecent(data);
+    } catch {/* ignore */}
+  };
+
+  useEffect(() => { loadRecent(); }, []);
+
+  useEffect(() => {
+    if (selected) loadHistory(selected);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selected, range]);
+
+  /* ----- Suggestions (debounced) ----- */
+  useEffect(() => {
+    const q = tickers.trim();
+    if (!q) {
+      setSuggest([]);
+      setShowSuggest(false);
+      return;
+    }
+    const id = setTimeout(async () => {
+      try {
+        setSuggestLoading(true);
+        const qs = new URLSearchParams({ q, limit: 16 }).toString();
+        const res = await fetch(`${API_BASE}/api/tickers/suggest?${qs}`);
+        if (!res.ok) throw new Error("suggest failed");
+        const data = await res.json();
+        // Expecting: [{symbol, name}] from your server
+        setSuggest(Array.isArray(data) ? data : []);
+        setShowSuggest(true);
+      } catch {
+        setSuggest([]);
+        setShowSuggest(false);
+      } finally {
+        setSuggestLoading(false);
+      }
+    }, 180);
+    return () => clearTimeout(id);
+  }, [tickers]);
+
+  /* ----- Derived data for charts ----- */
+  const {
+    enriched,
+    returnsSeries,
+    cumSeries,
+    volSeries,
+    momSeries,
+    mvScatter,
+    hasEnough,
+  } = useMemo(() => engineer(history), [history]);
+
+  const { bars: histBars } = useMemo(
+    () => buildHistogram(returnsSeries, histBins),
+    [returnsSeries, histBins]
+  );
+
+  const recentScores = useMemo(
+    () =>
+      (recent || []).slice().reverse().map((r, idx) => ({
+        idx,
+        time: new Date(r.timestamp).toLocaleString(),
+        score: r.score,
+      })),
+    [recent]
+  );
+
+  const best = useMemo(() => (predict?.best ? predict.best : null), [predict]);
+  const alts = useMemo(() => (predict?.alternatives ? predict.alternatives : []), [predict]);
+  const kpiColor = useMemo(() => {
+    const s = best?.score ?? 0;
+    if (s >= 0.7) return "kpi-green";
+    if (s >= 0.55) return "kpi-amber";
+    return "kpi-red";
+  }, [best]);
+
+  /* ================================
+     UI
+     ================================ */
+
+  return (
+    <div className="app-root">
+      <header className="app-header">
+        <div className="header-inner">
+          <div className="brand">
+            <TrendingUp className="icon" />
+            <h1 className="brand-title">Stock Advisor Dashboard</h1>
+          </div>
+          <div className="status">
+            <span className="api-health">
+              API: {apiHealth.ok ? "OK" : "—"} {apiHealth.ms ? `(${apiHealth.ms}ms)` : ""}
+            </span>
+            {loading ? <Loader2 className="spin icon" /> : <CheckCircle className="ok icon" />}
+          </div>
+        </div>
+      </header>
+
+      <main className="container">
+        {/* Controls */}
+        <section className="card">
+          <div className="controls">
+            <div className="field grow" style={{ position: "relative" }}>
+              <label className="label">Tickers</label>
+
+              {/* Selected bubbles + Clear All */}
+              <div className="bubble-row">
+                <div className="bubble-container">
+                  {selectedTickers.map((sym) => (
+                    <div key={sym} className="ticker-bubble" title={sym}>
+                      {sym}
+                      <button
+                        className="bubble-remove"
+                        onClick={() => setSelectedTickers(selectedTickers.filter((s) => s !== sym))}
+                        aria-label={`Remove ${sym}`}
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))}
+                </div>
+                <button
+                  type="button"
+                  className="btn subtle"
+                  onClick={() => { setSelectedTickers([]); setTickers(""); }}
+                  disabled={selectedTickers.length === 0 && !tickers.trim()}
+                  title="Clear all selected tickers and input"
+                >
+                  Clear All
+                </button>
+              </div>
+
+              {/* Text input for ad-hoc symbol/company search */}
+              <input
+                value={tickers}
+                onChange={(e) => setTickers(e.target.value.toUpperCase())}
+                onBlur={() => setTimeout(() => setShowSuggest(false), 150)}
+                onFocus={() => setShowSuggest(suggest.length > 0)}
+                className="input"
+                placeholder="Type a ticker or company name (e.g., AAPL, MICROSOFT)"
+                autoComplete="off"
+              />
+
+              {/* Suggestions as bubbles */}
+              {showSuggest && (
+                <div className="suggest-popover">
+                  {suggestLoading && <div className="suggest-item muted">Searching…</div>}
+                  {!suggestLoading && suggest.length === 0 && (
+                    <div className="suggest-item muted">No matches</div>
+                  )}
+                  {!suggestLoading &&
+                    suggest.map(({ symbol, name }) => (
+                      <button
+                        key={symbol}
+                        type="button"
+                        className="suggest-item"
+                        onMouseDown={(e) => e.preventDefault()}
+                        onClick={() => {
+                          const sym = String(symbol || "").toUpperCase();
+                          if (sym && !selectedTickers.includes(sym)) {
+                            setSelectedTickers([...selectedTickers, sym]);
+                          }
+                          setTickers("");
+                          setShowSuggest(false);
+                        }}
+                        title={name}
+                      >
+                        <span className="suggest-symbol">{symbol.toUpperCase()}</span>
+                        <span className="suggest-name">{name || "\u00A0"}</span>
+                      </button>
+                    ))}
+                </div>
+              )}
+            </div>
+
+            <div className="field">
+              <label className="label">Range</label>
+              <select
+                value={range}
+                onChange={(e) => setRange(e.target.value)}
+                className="select"
+              >
+                <option value="1mo">1 month</option>
+                <option value="3mo">3 months</option>
+                <option value="6mo">6 months</option>
+                <option value="1y">1 year</option>
+              </select>
+            </div>
+
+            <div className="btn-row">
+              <button onClick={runPredict} className="btn primary">
+                <Sparkles className="icon-sm" /> Recommend
+              </button>
+              <button
+                onClick={() => selected && loadHistory(selected)}
+                className="btn"
+                disabled={!selected}
+              >
+                <Search className="icon-sm" /> Refresh Chart
+              </button>
+            </div>
+          </div>
+
+          <div className="toggles">
+            <label className="toggle">
+              <input
+                type="checkbox"
+                checked={showMA5}
+                onChange={(e) => setShowMA5(e.target.checked)}
+              />
+              <span>Show MA5</span>
+            </label>
+            <label className="toggle">
+              <input
+                type="checkbox"
+                checked={showMA20}
+                onChange={(e) => setShowMA20(e.target.checked)}
+              />
+              <span>Show MA20</span>
+            </label>
+            <label className="toggle">
+              <span>Histogram bins:</span>
+              <input
+                type="number"
+                min="5"
+                max="60"
+                value={histBins}
+                onChange={(e) =>
+                  setHistBins(Math.max(5, Math.min(60, Number(e.target.value) || 20)))
+                }
+                className="input small"
+              />
+            </label>
+          </div>
+
+          {error && (
+            <div className="alert">
+              <AlertTriangle className="icon-sm" />
+              <span>{error}</span>
+            </div>
+          )}
+          {!predict && !error && (
+            <p className="muted">
+              Select bubbles or type symbols, then click <strong>Recommend</strong>.
+            </p>
+          )}
+
+          <div className="info-box">
+            <p>
+              <strong>MA5</strong> and <strong>MA20</strong> are <em>moving averages</em>—the average closing price
+              over the last 5 and 20 trading days. <strong>MA5</strong> reacts quickly to short-term moves, while{" "}
+              <strong>MA20</strong> smooths noise to show a medium-term trend. When MA5 crosses above MA20, it can
+              suggest rising momentum; crossing below can indicate a potential downtrend.
+            </p>
+          </div>
+        </section>
+
+        {/* KPI Row + Advisor */}
+        {predict && (
+          <section className="grid kpi-grid">
+            <div className="card kpi">
+              <div className="kpi-title">Best Stock (Prescribed Choice)</div>
+              <div className="kpi-main">{best?.ticker ?? "—"}</div>
+              <div className={`kpi-sub ${kpiColor}`}>
+                Confidence Score: {(best?.score ?? 0).toFixed(2)}
+              </div>
+              <div className="kpi-sub">Cluster: {best?.cluster ?? "—"}</div>
+            </div>
+            <div className="card kpi">
+              <div className="kpi-title">Market Regime</div>
+              <div className="kpi-main small">{predict?.regime ?? "—"}</div>
+            </div>
+            <div className="card kpi">
+              <div className="kpi-title">Currently Viewing</div>
+              <div className="kpi-main">{selected || "—"}</div>
+              <div className="kpi-sub">Range: {range}</div>
+            </div>
+            <div className="card kpi">
+              <div className="kpi-title">Advisor</div>
+              <div className="kpi-advice">
+                {best?.score >= 0.7
+                  ? "High confidence — favorable momentum with controlled volatility."
+                  : best?.score >= 0.55
+                  ? "Moderate confidence — consider with caution; validate against fundamentals."
+                  : "Low confidence — hold or seek alternatives."}
+              </div>
+            </div>
+          </section>
+        )}
+
+        {/* 1) Price History (Line) + MA5/MA20 */}
+        <section className="card">
+          <div className="card-header">
+            <h2 className="card-title">Price History {selected ? `– ${selected}` : ""}</h2>
+          </div>
+          {enriched.length > 0 ? (
+            <>
+              <div className="chart-wrap">
+                <LineChart width={880} height={300} data={enriched} margin={{ top: 10, right: 10, bottom: 0, left: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" />
+                  <XAxis dataKey="date" minTickGap={24} />
+                  <YAxis domain={["auto", "auto"]} />
+                  <Tooltip />
+                  <Legend />
+                  <Line type="monotone" dataKey="close" strokeWidth={2} dot={false} name={selected ? `${selected} Close` : "Close"} />
+                  {showMA5 && <Line type="monotone" dataKey="ma5" strokeWidth={1} dot={false} name="MA5" />}
+                  {showMA20 && <Line type="monotone" dataKey="ma20" strokeWidth={1} dot={false} name="MA20" />}
+                </LineChart>
+              </div>
+            </>
+          ) : (
+            <div className="empty">{selected ? "No history to display." : "No ticker selected."}</div>
+          )}
+        </section>
+
+        {/* 2) Volume (Bar) */}
+        <section className="card">
+          <h3 className="card-title mb">Daily Volume {selected ? `– ${selected}` : ""}</h3>
+          {enriched.length > 0 ? (
+            <div className="chart-wrap">
+              <BarChart width={880} height={240} data={enriched} margin={{ top: 10, right: 10, bottom: 0, left: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="date" minTickGap={24} />
+                <YAxis />
+                <Tooltip />
+                <Legend />
+                <Bar dataKey="volume" name="Volume" />
+              </BarChart>
+            </div>
+          ) : (
+            <div className="empty">No data.</div>
+          )}
+        </section>
+
+        {/* 3) Returns Histogram */}
+        <section className="card">
+          <h3 className="card-title mb">Daily Returns Histogram</h3>
+          {histBars.length > 0 ? (
+            <div className="chart-wrap">
+              <BarChart width={880} height={240} data={histBars} margin={{ top: 10, right: 10, bottom: 40, left: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="bin" angle={-35} textAnchor="end" interval={0} />
+                <YAxis />
+                <Tooltip />
+                <Legend />
+                <Bar dataKey="count" name="Count" />
+              </BarChart>
+            </div>
+          ) : (
+            <div className="empty">No return data.</div>
+          )}
+        </section>
+
+        {/* 4) Rolling Volatility */}
+        <section className="card">
+          <h3 className="card-title mb">Rolling Volatility (20D Std of Returns)</h3>
+          {volSeries.length > 0 ? (
+            <div className="chart-wrap">
+              <LineChart width={880} height={220} data={volSeries} margin={{ top: 10, right: 10, bottom: 0, left: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="date" minTickGap={24} />
+                <YAxis />
+                <Tooltip />
+                <Legend />
+                <Line type="monotone" dataKey="vol20" strokeWidth={2} dot={false} name="Volatility 20D" />
+              </LineChart>
+            </div>
+          ) : (
+            <div className="empty">No volatility data.</div>
+          )}
+        </section>
+
+        {/* 5) Cumulative Returns */}
+        <section className="card">
+          <h3 className="card-title mb">Cumulative Return (from start of range)</h3>
+          {cumSeries.length > 0 ? (
+            <div className="chart-wrap">
+              <LineChart width={880} height={220} data={cumSeries} margin={{ top: 10, right: 10, bottom: 0, left: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="date" minTickGap={24} />
+                <YAxis tickFormatter={(v) => `${(v * 100).toFixed(0)}%`} />
+                <Tooltip formatter={(v) => [`${(v * 100).toFixed(2)}%`, "Cumulative"]} />
+                <Legend />
+                <Line type="monotone" dataKey="cum" strokeWidth={2} dot={false} name="Cumulative Return" />
+              </LineChart>
+            </div>
+          ) : (
+            <div className="empty">No cumulative data.</div>
+          )}
+        </section>
+
+        {/* 6) Recent Prediction Scores */}
+        {recentScores.length > 0 && (
+          <section className="card">
+            <h3 className="card-title mb">Recent Prediction Scores</h3>
+            <div className="chart-wrap">
+              <LineChart width={880} height={220} data={recentScores} margin={{ top: 10, right: 10, bottom: 0, left: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="time" minTickGap={24} />
+                <YAxis domain={[0, 1]} />
+                <Tooltip />
+                <Legend />
+                <Line type="monotone" dataKey="score" strokeWidth={2} dot name="Score" />
+              </LineChart>
+            </div>
+          </section>
+        )}
+
+        {/* 7) Momentum vs Volatility (Scatter) */}
+        <section className="card">
+          <h3 className="card-title mb">Momentum vs Volatility (20D) {selected ? `– ${selected}` : ""}</h3>
+          {hasEnough ? (
+            <div className="chart-wrap">
+              <ScatterChart width={880} height={260} margin={{ top: 10, right: 10, bottom: 0, left: 0 }}>
+                <CartesianGrid />
+                <XAxis type="number" dataKey="vol" name="Volatility 20D" />
+                <YAxis type="number" dataKey="mom" name="Momentum 20D" />
+                <Tooltip cursor={{ strokeDasharray: "3 3" }} />
+                <Legend />
+                <Scatter name="Points" data={mvScatter} />
+              </ScatterChart>
+            </div>
+          ) : (
+            <div className="empty">Not enough rolling-window points yet.</div>
+          )}
+        </section>
+
+        {/* Alternatives */}
+        {alts.length > 0 && (
+          <section className="card">
+            <h3 className="card-title mb">Other Candidates (Context Only)</h3>
+            <div className="table-wrap">
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>Ticker</th>
+                    <th>Confidence</th>
+                    <th>Cluster</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {alts.map(({ ticker, score, cluster }) => (
+                    <tr key={ticker}>
+                      <td className="bold">{ticker}</td>
+                      <td>{Number(score).toFixed(2)}</td>
+                      <td>{cluster}</td>
+                      <td>
+                        <button onClick={() => setSelected(ticker)} className="link">
+                          View Chart
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        )}
+
+        {/* Recent Predictions */}
+        {recent.length > 0 && (
+          <section className="card">
+            <h3 className="card-title mb">Recent Predictions</h3>
+            <div className="table-wrap">
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>Time</th>
+                    <th>Ticker</th>
+                    <th>Score</th>
+                    <th>Decision</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {recent.map(({ timestamp, ticker, score, decision }, i) => (
+                    <tr key={`${ticker}-${i}`}>
+                      <td>{new Date(timestamp).toLocaleString()}</td>
+                      <td className="bold">{ticker}</td>
+                      <td>{Number(score).toFixed(2)}</td>
+                      <td>
+                        <span
+                          className={`pill ${
+                            decision === "BUY"
+                              ? "pill-green"
+                              : decision === "CONSIDER"
+                              ? "pill-amber"
+                              : "pill-gray"
+                          }`}
+                        >
+                          {decision}
+                        </span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        )}
+      </main>
+
+      <footer className="app-footer"></footer>
+    </div>
+  );
+}

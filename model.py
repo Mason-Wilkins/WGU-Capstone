@@ -21,7 +21,7 @@ class Stock(db.Model):
     low_price = db.Column(db.Float)
     close_price = db.Column(db.Float)
     adj_close_price = db.Column(db.Float)
-    volume = db.Column(db.Integer)
+    volume = db.Column(db.BigInteger)
     created_at = db.Column(db.DateTime, default=datetime.now(tz=None))
     
     def __repr__(self):
@@ -41,7 +41,31 @@ class Stock(db.Model):
         Created At = {self.created_at}
         >
         """
-    
+
+class StockPrice(db.Model):
+    __tablename__ = "stock_prices"
+    id = db.Column(db.Integer, primary_key=True)
+    ticker = db.Column(db.String(16), nullable=False, index=True)
+    date = db.Column(db.Date, nullable=False, index=True)
+    open = db.Column(db.Float)
+    high = db.Column(db.Float)
+    low = db.Column(db.Float)
+    close = db.Column(db.Float)
+    adj_close = db.Column(db.Float, nullable=True)
+    volume = db.Column(db.BigInteger)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+    __table_args__ = (db.UniqueConstraint("ticker", "date", name="uq_ticker_date"),)
+
+class PredictionLog(db.Model):
+    __tablename__ = "prediction_logs"
+    id = db.Column(db.Integer, primary_key=True)
+    timestamp = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    ticker = db.Column(db.String(16), nullable=False)
+    score = db.Column(db.Float, nullable=False)
+    decision = db.Column(db.String(16), nullable=False)  # e.g., BUY / CONSIDER / HOLD
+    details = db.Column(db.JSON, nullable=True)          # store scoring, features, etc.
+
 class Ticker(db.Model):
     """Model for Ticker class."""
     
@@ -79,7 +103,8 @@ def connect_to_db(app, db_name):
 
     # Initialize the db instance with the app
     db.init_app(app)
-    # db.create_all()
+    with app.app_context():
+        db.create_all()
     print("Connected to the db!")
 
 
