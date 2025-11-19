@@ -1,14 +1,41 @@
+"""Database models and DB helper for the application.
+
+This module defines the SQLAlchemy models used by the app and exposes
+`db` (a Flask-SQLAlchemy instance) and `connect_to_db` helper to wire
+the models to a Flask application.
+
+Models:
+ - Stock: normalized storage of historical daily bars ingested from yfinance
+ - StockPrice: legacy or alternative table for per-day prices (kept for compatibility)
+ - PredictionLog: stores model predictions and decision metadata
+ - Ticker: metadata about tickers
+"""
+
 from sqlalchemy.orm import DeclarativeBase
 from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime
 
 class Base(DeclarativeBase):
+    """Base declarative class used by SQLAlchemy (when needed).
+
+    Using a DeclarativeBase keeps compatibility with SQLAlchemy's
+    declarative features while we use Flask-SQLAlchemy's `db` object
+    for model definitions.
+    """
+
     pass
 
+# `db` is the Flask-SQLAlchemy facade used throughout the app. It
+# provides `Model`, `Column`, session and helper methods that are
+# convenient inside a Flask application context.
 db = SQLAlchemy(model_class=Base)
 
 class Stock(db.Model):
-    """Model for Stock class."""
+    """Normalized table for historical stock bars.
+
+    Each row represents a single daily bar for a ticker. This table is
+    the primary place the application writes and reads price history.
+    """
     
     __tablename__ = "stocks"
     
@@ -44,6 +71,9 @@ class Stock(db.Model):
 
 class StockPrice(db.Model):
     __tablename__ = "stock_prices"
+    # Alternative / legacy schema for per-ticker daily prices. The
+    # application uses `Stock` as the canonical table, but this model
+    # may exist for compatibility with other tools or earlier versions.
     id = db.Column(db.Integer, primary_key=True)
     ticker = db.Column(db.String(16), nullable=False, index=True)
     date = db.Column(db.Date, nullable=False, index=True)
@@ -53,11 +83,19 @@ class StockPrice(db.Model):
     close = db.Column(db.Float)
     adj_close = db.Column(db.Float, nullable=True)
     volume = db.Column(db.BigInteger)
+    # use a python-side default timestamp (UTC)
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
 
+    # ensure we don't insert duplicate (ticker, date) rows
     __table_args__ = (db.UniqueConstraint("ticker", "date", name="uq_ticker_date"),)
 
 class PredictionLog(db.Model):
+    """Stores prediction results and metadata.
+
+    Each row records a single prediction run for a ticker: the numeric
+    score, the string decision (BUY/CONSIDER/HOLD), and an optional
+    JSON blob that contains features, labels, and any debug info.
+    """
     __tablename__ = "prediction_logs"
     id = db.Column(db.Integer, primary_key=True)
     timestamp = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
@@ -67,7 +105,12 @@ class PredictionLog(db.Model):
     details = db.Column(db.JSON, nullable=True)          # store scoring, features, etc.
 
 class Ticker(db.Model):
-    """Model for Ticker class."""
+    """Metadata about known tickers (symbol, name, exchange, etc.).
+
+    This table helps power the ticker suggestion endpoint and stores
+    informational fields about each ticker. Fields are mostly nullable
+    because different data vendors expose different subsets of info.
+    """
     
     __tablename__ = "tickers"
     

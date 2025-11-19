@@ -1,6 +1,7 @@
 # --- add near top of crud.py (or keep your existing ones) ---
 import os, subprocess, threading, requests, datetime as dt, zipfile
 import pandas as pd
+import yfinance as yf
 
 from model import db, Stock, Ticker
 from ctx import with_app_context
@@ -14,9 +15,13 @@ def ensure_tickers():
         tickers = [str(t).strip() for t in nasdaq["Symbol"].tolist() if str(t).strip() != "nan"]
         with open("tickers.csv", "w") as f:
             for t in tickers:
-                # keep it reasonable
-                if len(t) <= 5:
-                    f.write(t + "\n")
+                t = str(t).strip()
+                if t == 'nan':
+                    continue
+                if len(t) > 5:
+                    break
+                f.write(t + "\n")
+
 
 @with_app_context
 def populate_recent_stocks(days_back: int = 365) -> dict[str, int]:
@@ -95,6 +100,120 @@ def populate_recent_stocks(days_back: int = 365) -> dict[str, int]:
     return {"tickers": len(tickers), "inserted": inserted_total}
 
 
+@with_app_context
+def backfill_missing_stock_dates(max_days: int | None = None) -> dict[str, int]:
+    """
+    Iterate over every ticker present in `stocks`, detect gaps within the stored
+    history, and pull any missing daily bars from yfinance.
+
+    Args:
+        max_days: Optional lookback limit. When provided, only dates within the
+                  last `max_days` are refreshed to reduce download size.
+    Returns:
+        Dict mapping ticker -> number of rows inserted.
+    """
+    session = db.session
+    tickers = [t[0] for t in session.query(Stock.ticker).distinct().all()]
+    if not tickers:
+        _mark("backfill_missing_stock_dates: no tickers in `stocks` table")
+        return {}
+
+    summary: dict[str, int] = {}
+    today = dt.date.today()
+
+    for sym in tickers:
+        sym = (sym or "").strip().upper()
+        if not sym:
+            continue
+
+        try:
+            min_max = (
+                session.query(
+                    func.min(func.date(Stock.date)),
+                    func.max(func.date(Stock.date)),
+                )
+                .filter(Stock.ticker == sym)
+                .first()
+            )
+            if not min_max or not min_max[0]:
+                continue
+
+            start_date = min_max[0]
+            if max_days is not None:
+                start_date = max(start_date, today - dt.timedelta(days=int(max_days)))
+            end_date = today
+            if start_date >= end_date:
+                summary[sym] = 0
+                continue
+
+            # Preload record_ids we already have in this window
+            existing_ids = {
+                rid
+                for (rid,) in session.query(Stock.record_id)
+                .filter(
+                    Stock.ticker == sym,
+                    func.date(Stock.date) >= start_date,
+                    func.date(Stock.date) <= end_date,
+                )
+                .all()
+            }
+
+            df = yf.download(
+                sym,
+                start=start_date.isoformat(),
+                end=(end_date + dt.timedelta(days=1)).isoformat(),
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                threads=False,
+            )
+            if df is None or df.empty:
+                summary[sym] = 0
+                continue
+
+            new_rows = []
+            for idx, row in df.iterrows():
+                ts = dt.datetime.utcfromtimestamp(idx.timestamp()) if hasattr(idx, "timestamp") else idx
+                rid = f"{sym}-{ts.strftime('%Y%m%d')}"
+                if rid in existing_ids:
+                    continue
+
+                close_val = row.get("Close")
+                if close_val is None or pd.isna(close_val):
+                    continue
+
+                new_rows.append(
+                    Stock(
+                        record_id=rid,
+                        ticker=sym,
+                        date=ts,
+                        open_price=float(row.get("Open")) if pd.notna(row.get("Open")) else None,
+                        high_price=float(row.get("High")) if pd.notna(row.get("High")) else None,
+                        low_price=float(row.get("Low")) if pd.notna(row.get("Low")) else None,
+                        close_price=float(close_val) if pd.notna(close_val) else None,
+                        adj_close_price=float(row.get("Adj Close")) if pd.notna(row.get("Adj Close")) else None,
+                        volume=int(row.get("Volume")) if pd.notna(row.get("Volume")) else None,
+                        created_at=dt.datetime.utcnow(),
+                    )
+                )
+
+            inserted = len(new_rows)
+            if inserted:
+                session.bulk_save_objects(new_rows)
+                session.commit()
+                _mark(f"{sym}: backfilled {inserted} missing rows ({start_date} -> {end_date})")
+            else:
+                session.rollback()
+
+            summary[sym] = inserted
+        except Exception as exc:
+            session.rollback()
+            summary[sym] = 0
+            _mark(f"{sym}: error during backfill_missing_stock_dates -> {exc}")
+
+    _mark("backfill_missing_stock_dates: completed")
+    return summary
+
 
 # ======= status helpers (reuse if you already have them) =======
 _population_status = {
@@ -114,6 +233,48 @@ def _mark(msg: str):
     # keep steps list bounded
     if len(_population_status["steps"]) > 200:
         _population_status["steps"] = _population_status["steps"][-200:]
+
+@with_app_context
+def remove_empty_tickers(batch_size: int = 500, dry_run: bool = False) -> dict[str, int]:
+    """Delete tickers that do not have any rows in `stocks`.
+
+    Args:
+        batch_size: number of tickers to delete per commit.
+        dry_run: if True, only report how many would be deleted.
+    Returns:
+        Summary dict with counts of found/deleted tickers.
+    """
+    session = db.session
+    base_query = (
+        session.query(Ticker)
+        .outerjoin(Stock, Stock.ticker == Ticker.ticker)
+        .filter(Stock.ticker.is_(None))
+    )
+
+    total_orphans = base_query.count()
+    _mark(f"remove_empty_tickers: found {total_orphans} orphan tickers (dry_run={dry_run})")
+
+    if dry_run or total_orphans == 0:
+        return {"found": total_orphans, "deleted": 0, "dry_run": dry_run}
+
+    deleted = 0
+    while True:
+        batch = (
+            session.query(Ticker)
+            .outerjoin(Stock, Stock.ticker == Ticker.ticker)
+            .filter(Stock.ticker.is_(None))
+            .limit(batch_size)
+            .all()
+        )
+        if not batch:
+            break
+        for ticker in batch:
+            session.delete(ticker)
+        session.commit()
+        deleted += len(batch)
+
+    _mark(f"remove_empty_tickers: deleted {deleted} tickers")
+    return {"found": total_orphans, "deleted": deleted, "dry_run": False}
 
 @with_app_context
 def get_population_status():
@@ -321,18 +482,8 @@ def kickoff_background_population(
 
             # 3) Populate/refresh prices using your existing code paths.
             #    If you have populate_stocks_yf_batched(...) use it; otherwise fallback to populate_recent_stocks().
-            try:
-                from crud import populate_stocks_yf_batched  # only if you implemented it
-                has_batched = True
-            except Exception:
-                has_batched = False
 
-            if use_batched_prices and has_batched:
-                _mark(f"populate stocks (batched yf.download, batch_size={batch_size})")
-                prices_summary = populate_stocks_yf_batched(batch_size=batch_size)
-            else:
-                _mark("populate stocks (incremental yfinance)")
-                prices_summary = populate_recent_stocks()
+            prices_summary = populate_recent_stocks()
 
             _mark(f"prices summary: {prices_summary}")
 

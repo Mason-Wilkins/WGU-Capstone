@@ -114,6 +114,37 @@ body { margin: 0; background: var(--bg); color: var(--text); font-family: ui-san
 .kpi-amber { color: var(--amber); }
 .kpi-red { color: var(--red); }
 
+.accuracy-card { margin-top: 16px; }
+.accuracy-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.accuracy-window { font-size: 13px; color: var(--muted); }
+.accuracy-metrics {
+  margin-top: 14px;
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.accuracy-metrics .metric {
+  flex: 1;
+  min-width: 160px;
+  padding: 12px;
+  border: 1px solid #eef2ff;
+  border-radius: 10px;
+  background: #f8fafc;
+}
+.metric-label { display: block; font-size: 12px; text-transform: uppercase; color: var(--muted); letter-spacing: 0.04em; }
+.metric-value { display: block; margin-top: 6px; font-size: 20px; font-weight: 600; color: var(--text); }
+.accuracy-placeholder {
+  margin-top: 12px;
+  font-size: 14px;
+  color: var(--muted);
+}
+
 /* Charts */
 .chart-wrap { width: 100%; overflow-x: auto; }
 .empty {
@@ -308,6 +339,15 @@ body { margin: 0; background: var(--bg); color: var(--text); font-family: ui-san
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.range-control {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.range-control .input {
+  max-width: 90px;
 }
 
 .suggest-item.muted {

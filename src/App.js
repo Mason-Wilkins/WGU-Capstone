@@ -1,5 +1,5 @@
 // src/App.js
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid, Legend,
   BarChart, Bar, ScatterChart, Scatter
@@ -12,6 +12,13 @@ import "./App.css";
 // Normalize API base (strip trailing slashes). Default to local Flask dev server.
 const RAW_API_BASE = process.env.REACT_APP_API_BASE || "http://localhost:5000";
 const API_BASE = RAW_API_BASE.replace(/\/+$/, "");
+const API_KEY = process.env.REACT_APP_API_KEY || "";
+const AUTH_HEADERS = API_KEY ? { "X-API-Key": API_KEY } : {};
+const RANGE_LIMITS = { d: 365 * 3, mo: 36, y: 3 };
+const LINE_COLORS = [
+  "#2563eb", "#16a34a", "#dc2626", "#9333ea", "#0d9488",
+  "#f97316", "#0891b2", "#f43f5e", "#7c3aed", "#84cc16"
+];
 
 /* ================================
    Feature engineering / wrangling
@@ -163,11 +170,14 @@ export default function StockAdvisorDashboard() {
   // selected bubbles
   const [selectedTickers, setSelectedTickers] = useState([]);
 
-  const [range, setRange] = useState("6mo");
+  const [rangeValue, setRangeValue] = useState(6);
+  const [rangeUnit, setRangeUnit] = useState("mo"); // "d" | "mo" | "y"
   const [selected, setSelected] = useState("");
-  const [history, setHistory] = useState([]);     // [{date, close, volume}]
+  const [historyMap, setHistoryMap] = useState({});     // {symbol: [{date, close, volume}]}
   const [predict, setPredict] = useState(null);   // { best, alternatives, regime }
   const [recent, setRecent] = useState([]);
+  const [accuracy, setAccuracy] = useState(null);
+  const [accuracyLoading, setAccuracyLoading] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
@@ -175,6 +185,9 @@ export default function StockAdvisorDashboard() {
   const [showMA5, setShowMA5] = useState(true);
   const [showMA20, setShowMA20] = useState(true);
   const [histBins, setHistBins] = useState(20);
+  const [riskProfile, setRiskProfile] = useState("balanced");
+  const [momentumWindow, setMomentumWindow] = useState(20);
+  const [volWindow, setVolWindow] = useState(20);
 
   // API health
   const [apiHealth, setApiHealth] = useState({ ok: false, ms: null });
@@ -184,40 +197,80 @@ export default function StockAdvisorDashboard() {
   const [showSuggest, setShowSuggest] = useState(false);
   const [suggestLoading, setSuggestLoading] = useState(false);
 
-  /* ----- Load history for chart ----- */
-  const loadHistory = async (tkr) => {
-    if (!tkr) return;
-    const t0 = performance.now();
-    try {
-      setLoading(true);
-      setError("");
-      const qs = new URLSearchParams({ ticker: tkr.toUpperCase(), range }).toString();
-      const res = await fetch(`${API_BASE}/api/history?${qs}`);
-      const t1 = performance.now();
-      setApiHealth({ ok: res.ok, ms: Math.round(t1 - t0) });
+  const normalizeRangeValue = useCallback((value, unit) => {
+    const limit = RANGE_LIMITS[unit] ?? RANGE_LIMITS.mo;
+    const safeVal = Number.isFinite(value) ? value : 1;
+    return Math.min(limit, Math.max(1, Math.trunc(safeVal)));
+  }, []);
 
-      if (!res.ok) throw new Error(`History fetch failed: ${res.status}`);
+  const rangeParam = useMemo(() => `${rangeValue}${rangeUnit}`, [rangeValue, rangeUnit]);
+  const rangeLabel = useMemo(() => {
+    const unitLabel = rangeUnit === "d" ? "day" : rangeUnit === "mo" ? "month" : "year";
+    const plural = rangeValue === 1 ? "" : "s";
+    return `${rangeValue} ${unitLabel}${plural}`;
+  }, [rangeValue, rangeUnit]);
+
+  const loadAccuracy = useCallback(async () => {
+    setAccuracyLoading(true);
+    try {
+      const qs = new URLSearchParams({ windowDays: 45, horizonDays: 5 }).toString();
+      const res = await fetch(`${API_BASE}/api/metrics/accuracy?${qs}`, { headers: AUTH_HEADERS });
+      if (!res.ok) throw new Error("accuracy fetch failed");
       const data = await res.json();
-      if (!Array.isArray(data) || data.length === 0) {
-        setHistory([]);
-        setError(`No history returned for ${tkr}.`);
-        return;
-      }
-      setHistory(data);
-    } catch (e) {
-      const msg = e?.message || "Failed to load history.";
-      const maybeCORS = msg.includes("Failed to fetch") || msg.includes("TypeError");
-      setHistory([]);
-      setError(maybeCORS ? `${msg} — Is Flask running on ${API_BASE}? CORS configured for http://localhost:3000?` : msg);
-      setApiHealth({ ok: false, ms: null });
+      setAccuracy(data);
+    } catch {
+      setAccuracy(null);
     } finally {
-      setLoading(false);
+      setAccuracyLoading(false);
     }
-  };
+  }, []);
+
+  /* ----- Load history for chart ----- */
+  const loadHistory = useCallback(
+    async (tkr, { silent = false } = {}) => {
+      if (!tkr) return;
+      const ticker = tkr.toUpperCase();
+      const t0 = performance.now();
+      try {
+        if (!silent) {
+          setLoading(true);
+          setError("");
+        }
+        const qs = new URLSearchParams({ ticker, range: rangeParam }).toString();
+        const res = await fetch(`${API_BASE}/api/history?${qs}`, { headers: AUTH_HEADERS });
+        const t1 = performance.now();
+        if (!silent) setApiHealth({ ok: res.ok, ms: Math.round(t1 - t0) });
+
+        if (!res.ok) throw new Error(`History fetch failed: ${res.status}`);
+        const data = await res.json();
+        if (!Array.isArray(data) || data.length === 0) {
+          if (!silent) setError(`No history returned for ${ticker}.`);
+          setHistoryMap((prev) => ({ ...prev, [ticker]: [] }));
+          return;
+        }
+        setHistoryMap((prev) => ({ ...prev, [ticker]: data }));
+      } catch (e) {
+        if (!silent) {
+          const msg = e?.message || "Failed to load history.";
+          const maybeCORS = msg.includes("Failed to fetch") || msg.includes("TypeError");
+          setError(
+            maybeCORS
+              ? `${msg} — Is Flask running on ${API_BASE}? CORS configured for http://localhost:3000?`
+              : msg
+          );
+          setApiHealth({ ok: false, ms: null });
+        }
+        setHistoryMap((prev) => ({ ...prev, [ticker]: [] }));
+      } finally {
+        if (!silent) setLoading(false);
+      }
+    },
+    [rangeParam]
+  );
 
   /* ----- Run prescriptive endpoint ----- */
   const runPredict = async () => {
-    // Merge bubbles + any ad-hoc text; unique & uppercase
+    // Merge bubbles + free-text, uppercase & de-dup
     const list = [...selectedTickers];
     if (tickers.trim()) list.push(tickers.trim().toUpperCase());
     const uniqueList = Array.from(new Set(list)).filter(Boolean);
@@ -226,15 +279,27 @@ export default function StockAdvisorDashboard() {
       setError("Select or type at least one ticker.");
       return;
     }
+
     try {
       setLoading(true);
       setError("");
-      const body = { tickers: uniqueList, k: 3, range };
+
+      const body = {
+        tickers: uniqueList,
+        k: 3,
+        range: rangeParam,
+        // NEW knobs wired to the backend:
+        momentumWindow,
+        volWindow,
+        riskProfile,      // "conservative" | "balanced" | "aggressive"
+      };
+
       const res = await fetch(`${API_BASE}/api/predict`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...AUTH_HEADERS },
         body: JSON.stringify(body),
       });
+
       if (!res.ok) throw new Error(`Predict failed: ${res.status}`);
       const data = await res.json();
       setPredict(data || null);
@@ -243,34 +308,29 @@ export default function StockAdvisorDashboard() {
       if (bestTicker) {
         setSelected(bestTicker);
         await loadHistory(bestTicker);
+        const others = uniqueList.filter((sym) => sym !== bestTicker);
+        await Promise.all(others.map((sym) => loadHistory(sym, { silent: true })));
       } else {
         setSelected("");
-        setHistory([]);
-        const regime = data?.regime || "No best recommendation returned by API.";
-        const skipped = data?.debug?.skipped
-          ? ` Skipped: ${Object.entries(data.debug.skipped).map(([t, why]) => `${t}=${why}`).join(", ")}`
-          : "";
-        const windowing = data?.debug?.start
-          ? ` (window ${data.debug.start} → ${data.debug.end || "today"})`
-          : "";
-        setError(`${regime}.${skipped}${windowing}`);
+        setError(data?.regime || "No best recommendation returned by API.");
       }
+      await loadAccuracy();
     } catch (e) {
       const msg = e?.message || "Failed to run prediction.";
       const maybeCORS = msg.includes("Failed to fetch") || msg.includes("TypeError");
       setPredict(null);
       setSelected("");
-      setHistory([]);
-      setError(maybeCORS ? `${msg} — Is Flask running on ${API_BASE}? CORS configured for http://localhost:3000?` : msg);
+      setError(maybeCORS ? `${msg} — Is Flask running on ${API_BASE}? CORS allows http://localhost:3000?` : msg);
     } finally {
       setLoading(false);
     }
   };
 
+
   /* ----- Recent predictions (monitoring) ----- */
   const loadRecent = async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/recent-predictions`);
+      const res = await fetch(`${API_BASE}/api/recent-predictions`, { headers: AUTH_HEADERS });
       if (!res.ok) return; // silently ignore
       const data = await res.json();
       if (Array.isArray(data)) setRecent(data);
@@ -278,11 +338,12 @@ export default function StockAdvisorDashboard() {
   };
 
   useEffect(() => { loadRecent(); }, []);
+  useEffect(() => { loadAccuracy(); }, [loadAccuracy]);
 
   useEffect(() => {
     if (selected) loadHistory(selected);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selected, range]);
+  }, [selected, loadHistory]);
 
   /* ----- Suggestions (debounced) ----- */
   useEffect(() => {
@@ -296,7 +357,7 @@ export default function StockAdvisorDashboard() {
       try {
         setSuggestLoading(true);
         const qs = new URLSearchParams({ q, limit: 16 }).toString();
-        const res = await fetch(`${API_BASE}/api/tickers/suggest?${qs}`);
+        const res = await fetch(`${API_BASE}/api/tickers/suggest?${qs}`, { headers: AUTH_HEADERS });
         if (!res.ok) throw new Error("suggest failed");
         const data = await res.json();
         // Expecting: [{symbol, name}] from your server
@@ -313,15 +374,52 @@ export default function StockAdvisorDashboard() {
   }, [tickers]);
 
   /* ----- Derived data for charts ----- */
+  const selectedHistory = useMemo(
+    () => historyMap[selected] || [],
+    [historyMap, selected]
+  );
   const {
     enriched,
     returnsSeries,
     cumSeries,
     volSeries,
-    momSeries,
     mvScatter,
     hasEnough,
-  } = useMemo(() => engineer(history), [history]);
+  } = useMemo(() => engineer(selectedHistory), [selectedHistory]);
+
+  const multiHistory = useMemo(() => {
+    const rowsByDate = new Map();
+    const activeSymbols = new Set();
+
+    Object.entries(historyMap).forEach(([symbol, rows]) => {
+      if (!rows || rows.length === 0) return;
+      activeSymbols.add(symbol);
+      rows.forEach(({ date, close }) => {
+        const key = date;
+        if (!rowsByDate.has(key)) rowsByDate.set(key, { date: key });
+        rowsByDate.get(key)[symbol] = close;
+      });
+    });
+
+    const merged = Array.from(rowsByDate.values()).sort(
+      (a, b) => new Date(a.date) - new Date(b.date)
+    );
+    return { data: merged, symbols: Array.from(activeSymbols) };
+  }, [historyMap]);
+
+  const priceChartData = useMemo(() => {
+    if (!selected || multiHistory.data.length === 0) return multiHistory.data;
+    const enrichedMap = new Map(enriched.map((row) => [row.date, row]));
+    return multiHistory.data.map((row) => {
+      const next = { ...row };
+      const match = enrichedMap.get(row.date);
+      if (match) {
+        next.__selected_ma5 = match.ma5;
+        next.__selected_ma20 = match.ma20;
+      }
+      return next;
+    });
+  }, [multiHistory.data, enriched, selected]);
 
   const { bars: histBars } = useMemo(
     () => buildHistogram(returnsSeries, histBins),
@@ -339,7 +437,18 @@ export default function StockAdvisorDashboard() {
   );
 
   const best = useMemo(() => (predict?.best ? predict.best : null), [predict]);
-  const alts = useMemo(() => (predict?.alternatives ? predict.alternatives : []), [predict]);
+  const alternatives = useMemo(() => (predict?.alternatives ? predict.alternatives : []), [predict]);
+  const accuracySummary = useMemo(() => {
+    if (!accuracy || !accuracy.evaluated) return null;
+    const pct = (val) => (typeof val === "number" ? `${(val * 100).toFixed(1)}%` : "—");
+    return [
+      { label: "Hit Rate", value: pct(accuracy.hit_rate) },
+      { label: "Avg Return", value: `${(accuracy.avg_return_pct ?? 0).toFixed(2)}%` },
+      { label: "Median Return", value: `${(accuracy.median_return_pct ?? 0).toFixed(2)}%` },
+      { label: "Buy Precision", value: pct(accuracy.buy_precision) },
+      { label: "Hold Precision", value: pct(accuracy.hold_precision) },
+    ];
+  }, [accuracy]);
   const kpiColor = useMemo(() => {
     const s = best?.score ?? 0;
     if (s >= 0.7) return "kpi-green";
@@ -447,16 +556,33 @@ export default function StockAdvisorDashboard() {
 
             <div className="field">
               <label className="label">Range</label>
-              <select
-                value={range}
-                onChange={(e) => setRange(e.target.value)}
-                className="select"
-              >
-                <option value="1mo">1 month</option>
-                <option value="3mo">3 months</option>
-                <option value="6mo">6 months</option>
-                <option value="1y">1 year</option>
-              </select>
+              <div className="range-control">
+                <input
+                  type="number"
+                  min={1}
+                  max={RANGE_LIMITS[rangeUnit]}
+                  value={rangeValue}
+                  onChange={(e) =>
+                    setRangeValue(
+                      normalizeRangeValue(Number(e.target.value) || 1, rangeUnit)
+                    )
+                  }
+                  className="input"
+                />
+                <select
+                  value={rangeUnit}
+                  onChange={(e) => {
+                    const nextUnit = e.target.value;
+                    setRangeUnit(nextUnit);
+                    setRangeValue((val) => normalizeRangeValue(val, nextUnit));
+                  }}
+                  className="select"
+                >
+                  <option value="d">Days</option>
+                  <option value="mo">Months</option>
+                  <option value="y">Years</option>
+                </select>
+              </div>
             </div>
 
             <div className="btn-row">
@@ -472,6 +598,48 @@ export default function StockAdvisorDashboard() {
               </button>
             </div>
           </div>
+
+         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
+          <div className="field">
+            <label className="label">Risk Profile</label>
+            <select
+              value={riskProfile}
+              onChange={e => setRiskProfile(e.target.value)}
+              className="select"
+            >
+              <option value="conservative">Conservative</option>
+              <option value="balanced">Balanced</option>
+              <option value="aggressive">Aggressive</option>
+            </select>
+          </div>
+
+          <div className="field">
+            <label className="label">Momentum Window (days)</label>
+            <input
+              type="number"
+              min={5}
+              max={90}
+              value={momentumWindow}
+              onChange={e => setMomentumWindow(Number(e.target.value))}
+              className="input"
+            />
+          </div>
+
+          <div className="field">
+            <label className="label">Volatility Window (days)</label>
+            <input
+              type="number"
+              min={5}
+              max={60}
+              value={volWindow}
+              onChange={e => setVolWindow(Number(e.target.value))}
+              className="input"
+            />
+          </div>
+
+        </div>
+
+
 
           <div className="toggles">
             <label className="toggle">
@@ -545,7 +713,7 @@ export default function StockAdvisorDashboard() {
             <div className="card kpi">
               <div className="kpi-title">Currently Viewing</div>
               <div className="kpi-main">{selected || "—"}</div>
-              <div className="kpi-sub">Range: {range}</div>
+              <div className="kpi-sub">Range: {rangeLabel}</div>
             </div>
             <div className="card kpi">
               <div className="kpi-title">Advisor</div>
@@ -560,26 +728,83 @@ export default function StockAdvisorDashboard() {
           </section>
         )}
 
+        {/* Model accuracy overview */}
+        <section className="card accuracy-card">
+          <div className="accuracy-header">
+            <h3 className="card-title">Model Accuracy</h3>
+            {accuracy?.evaluated ? (
+              <div className="accuracy-window">
+                Window: last {accuracy.window_days}d • Horizon: {accuracy.horizon_days}d • Samples: {accuracy.evaluated}
+              </div>
+            ) : null}
+          </div>
+          {accuracyLoading && <div className="accuracy-placeholder">Loading…</div>}
+          {!accuracyLoading && accuracySummary && (
+            <div className="accuracy-metrics">
+              {accuracySummary.map(({ label, value }) => (
+                <div key={label} className="metric">
+                  <span className="metric-label">{label}</span>
+                  <span className="metric-value">{value}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {!accuracyLoading && !accuracySummary && (
+            <div className="accuracy-placeholder">
+              Not enough logged predictions yet. Run `/api/predict` to start collecting samples.
+            </div>
+          )}
+        </section>
+
         {/* 1) Price History (Line) + MA5/MA20 */}
         <section className="card">
           <div className="card-header">
-            <h2 className="card-title">Price History {selected ? `– ${selected}` : ""}</h2>
+            <h2 className="card-title">Price History ({multiHistory.symbols.length || "0"} tickers)</h2>
           </div>
-          {enriched.length > 0 ? (
-            <>
-              <div className="chart-wrap">
-                <LineChart width={880} height={300} data={enriched} margin={{ top: 10, right: 10, bottom: 0, left: 0 }}>
-                  <CartesianGrid strokeDasharray="3 3" />
-                  <XAxis dataKey="date" minTickGap={24} />
-                  <YAxis domain={["auto", "auto"]} />
-                  <Tooltip />
-                  <Legend />
-                  <Line type="monotone" dataKey="close" strokeWidth={2} dot={false} name={selected ? `${selected} Close` : "Close"} />
-                  {showMA5 && <Line type="monotone" dataKey="ma5" strokeWidth={1} dot={false} name="MA5" />}
-                  {showMA20 && <Line type="monotone" dataKey="ma20" strokeWidth={1} dot={false} name="MA20" />}
-                </LineChart>
-              </div>
-            </>
+          {multiHistory.data.length > 0 ? (
+            <div className="chart-wrap">
+              <LineChart width={880} height={300} data={priceChartData} margin={{ top: 10, right: 10, bottom: 0, left: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="date" minTickGap={24} />
+                <YAxis domain={["auto", "auto"]} />
+                <Tooltip />
+                <Legend />
+                {multiHistory.symbols.map((sym, idx) => (
+                  <Line
+                    key={sym}
+                    type="monotone"
+                    dataKey={sym}
+                    strokeWidth={sym === selected ? 3 : 2}
+                    dot={false}
+                    name={sym}
+                    stroke={LINE_COLORS[idx % LINE_COLORS.length]}
+                    opacity={sym === selected ? 1 : 0.7}
+                  />
+                ))}
+                {selected && showMA5 && (
+                  <Line
+                    type="monotone"
+                    dataKey="__selected_ma5"
+                    strokeWidth={1}
+                    dot={false}
+                    name={`${selected} MA5`}
+                    stroke="#94a3b8"
+                    strokeDasharray="4 4"
+                  />
+                )}
+                {selected && showMA20 && (
+                  <Line
+                    type="monotone"
+                    dataKey="__selected_ma20"
+                    strokeWidth={1}
+                    dot={false}
+                    name={`${selected} MA20`}
+                    stroke="#475569"
+                    strokeDasharray="6 4"
+                  />
+                )}
+              </LineChart>
+            </div>
           ) : (
             <div className="empty">{selected ? "No history to display." : "No ticker selected."}</div>
           )}
@@ -698,7 +923,7 @@ export default function StockAdvisorDashboard() {
         </section>
 
         {/* Alternatives */}
-        {alts.length > 0 && (
+        {alternatives.length > 0 && (
           <section className="card">
             <h3 className="card-title mb">Other Candidates (Context Only)</h3>
             <div className="table-wrap">
@@ -712,7 +937,7 @@ export default function StockAdvisorDashboard() {
                   </tr>
                 </thead>
                 <tbody>
-                  {alts.map(({ ticker, score, cluster }) => (
+                  {alternatives.map(({ ticker, score, cluster }) => (
                     <tr key={ticker}>
                       <td className="bold">{ticker}</td>
                       <td>{Number(score).toFixed(2)}</td>
