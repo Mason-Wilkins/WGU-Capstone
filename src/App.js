@@ -192,6 +192,17 @@ export default function StockAdvisorDashboard() {
   const [showSuggest, setShowSuggest] = useState(false);
   const [suggestLoading, setSuggestLoading] = useState(false);
 
+  const handleClearAll = useCallback(() => {
+    setSelectedTickers([]);
+    setTickers("");
+    setPredict(null);
+    setSelected("");
+    setHistoryMap({});
+    setError("");
+    setShowSuggest(false);
+    setSuggest([]);
+  }, []);
+
   const normalizeRangeValue = useCallback((value, unit) => {
     const limit = RANGE_LIMITS[unit] ?? RANGE_LIMITS.mo;
     const safeVal = Number.isFinite(value) ? value : 1;
@@ -482,7 +493,7 @@ export default function StockAdvisorDashboard() {
                 <button
                   type="button"
                   className="btn subtle"
-                  onClick={() => { setSelectedTickers([]); setTickers(""); }}
+                  onClick={handleClearAll}
                   disabled={selectedTickers.length === 0 && !tickers.trim()}
                   title="Clear all selected tickers and input"
                 >
