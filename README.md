@@ -161,6 +161,7 @@ The repo hosts:
 | Inspect population status | `curl http://localhost:5000/api/status` |
 | View recent predictions | `curl http://localhost:5000/api/recent-predictions` |
 | Refresh Kaggle tickers only | `python - <<'PY'\nfrom crud import populate_tickers_from_kaggle\nsummary = populate_tickers_from_kaggle('./data/symbols_valid_meta.csv')\nprint(summary)\nPY` |
+| Generate reports/models artifacts | `python scripts/generate_artifacts.py` |
 
 ---
 

@@ -2,24 +2,17 @@
 
 from __future__ import annotations
 
-import os
-import re
-import statistics
-import threading
-import datetime as dt
+import csv, json, os, re, statistics, threading 
 from functools import wraps
-from typing import Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-import crud
-import numpy as np
+import datetime as dt
 import pandas as pd
-import yfinance as yf
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from sqlalchemy import func
 
-from kmeans import KMeans
-from model import PredictionLog, Stock, Ticker, connect_to_db, db
+import crud
 
 # ---------------------------------------------------------------------------
 # Flask setup & runtime configuration
@@ -27,13 +20,13 @@ from model import PredictionLog, Stock, Ticker, connect_to_db, db
 
 FLASK_APP_SECRET_KEY = os.environ.get("FLASK_APP_SECRET_KEY", "dev-secret")
 API_AUTH_TOKEN = os.environ.get("API_AUTH_TOKEN", "").strip()
-STARTUP_POPULATE = os.getenv("STARTUP_POPULATE", "1").lower() in {"1", "true", "yes"}
-
-LOOKBACK_DAYS = 60
 DEFAULT_RANGE = "6mo"
 MAX_RANGE_DAYS = 365 * 3
 DEFAULT_METRICS_WINDOW = int(os.getenv("ACCURACY_WINDOW_DAYS", "45") or 45)
 DEFAULT_METRICS_HORIZON = int(os.getenv("ACCURACY_HORIZON_DAYS", "5") or 5)
+RECENT_PREDICTIONS_FILE = Path("recent_predictions.csv")
+PREDICTION_FIELDS = ["timestamp", "ticker", "score", "decision", "details"]
+_SYMBOL_ROWS: List[Dict[str, str]] | None = None
 
 app = Flask(__name__)
 app.secret_key = FLASK_APP_SECRET_KEY
@@ -48,9 +41,6 @@ CORS(
         }
     },
 )
-
-connect_to_db(app, "stocks")
-_startup_once = threading.Event()
 
 # ---------------------------------------------------------------------------
 # Security helpers
@@ -117,213 +107,104 @@ def parse_range_to_start(rng: str) -> dt.date:
     return today - dt.timedelta(days=180)
 
 
-def safe_float(value, default=None):
-    """Coerce to float, returning a default when conversion fails."""
-
-    try:
-        v = float(value)
-        if np.isfinite(v):
-            return v
-        return default
-    except Exception:
-        return default
+def _ensure_predictions_csv() -> None:
+    if RECENT_PREDICTIONS_FILE.exists():
+        return
+    RECENT_PREDICTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with RECENT_PREDICTIONS_FILE.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=PREDICTION_FIELDS)
+        writer.writeheader()
 
 
-def fetch_and_upsert_yfinance_stock(
-    ticker: str, start_date: dt.date, end_date: Optional[dt.date] = None
-) -> int:
-    """Download daily bars via yfinance and upsert them into `Stock`."""
+def append_recent_prediction(record: Dict[str, Any]) -> None:
+    """Append a prediction record to the CSV log."""
 
-    ticker = str(ticker).upper().strip()
-    yf_end = end_date.isoformat() if end_date else None
+    _ensure_predictions_csv()
+    row = {
+        "timestamp": record.get("timestamp", ""),
+        "ticker": record.get("ticker", ""),
+        "score": record.get("score", ""),
+        "decision": record.get("decision", ""),
+        "details": json.dumps(record.get("details") or {}),
+    }
+    with RECENT_PREDICTIONS_FILE.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=PREDICTION_FIELDS)
+        writer.writerow(row)
 
-    hist = yf.download(
-        ticker,
-        start=start_date.isoformat(),
-        end=yf_end,
-        interval="1d",
-        auto_adjust=True,
-        progress=False,
-    )
-    if hist is None or hist.empty:
-        return 0
 
-    if isinstance(hist.columns, pd.MultiIndex):
-        hist.columns = ["_".join([c for c in tup if c]).strip() for tup in hist.columns.values]
+def load_recent_prediction_rows(
+    limit: Optional[int] = None, cutoff: Optional[dt.datetime] = None
+) -> List[Dict[str, Any]]:
+    """Load predictions from CSV, optionally filtering by time and limit."""
 
-    inserted = 0
-    session = db.session
-    for idx, row in hist.iterrows():
-        dt_val = idx.to_pydatetime()
-        record_id = f"{ticker}-{idx.strftime('%Y%m%d')}"
-
-        if session.query(Stock).filter(Stock.record_id == record_id).first():
-            continue
-
-        session.add(
-            Stock(
-                record_id=record_id,
-                ticker=ticker,
-                date=dt_val,
-                open_price=float(row["Open"]) if pd.notna(row.get("Open")) else None,
-                high_price=float(row["High"]) if pd.notna(row.get("High")) else None,
-                low_price=float(row["Low"]) if pd.notna(row.get("Low")) else None,
-                close_price=float(row["Close"]) if pd.notna(row.get("Close")) else None,
-                adj_close_price=None,
-                volume=int(row["Volume"]) if pd.notna(row.get("Volume")) else None,
+    if not RECENT_PREDICTIONS_FILE.exists():
+        return []
+    rows: List[Dict[str, Any]] = []
+    with RECENT_PREDICTIONS_FILE.open() as f:
+        reader = csv.DictReader(f)
+        for raw in reader:
+            ts_raw = raw.get("timestamp")
+            try:
+                ts = dt.datetime.fromisoformat(ts_raw) if ts_raw else None
+            except Exception:
+                ts = None
+            if ts is None:
+                continue
+            if cutoff and ts < cutoff:
+                continue
+            try:
+                details = json.loads(raw.get("details") or "{}")
+            except Exception:
+                details = {}
+            rows.append(
+                {
+                    "timestamp": ts,
+                    "ticker": (raw.get("ticker") or "").upper(),
+                    "score": crud.safe_float(raw.get("score"), 0.0) or 0.0,
+                    "decision": raw.get("decision") or "",
+                    "details": details,
+                }
             )
-        )
-        inserted += 1
+    rows.sort(key=lambda r: r["timestamp"], reverse=True)
+    if limit is not None:
+        rows = rows[:limit]
+    return rows
 
-    session.commit()
-    return inserted
+
+def load_symbol_directory() -> List[Dict[str, str]]:
+    """Load cached symbol/name rows from the Kaggle metadata CSV."""
+
+    global _SYMBOL_ROWS
+    if _SYMBOL_ROWS is not None:
+        return _SYMBOL_ROWS
+
+    path = Path("data/symbols_valid_meta.csv")
+    if not path.exists():
+        _SYMBOL_ROWS = []
+        return _SYMBOL_ROWS
+
+    rows: List[Dict[str, str]] = []
+    with path.open() as f:
+        reader = csv.DictReader(f)
+        for raw in reader:
+            symbol = (raw.get("Symbol") or "").strip().upper()
+            name = (raw.get("Security Name") or "").strip()
+            if not symbol:
+                continue
+            rows.append({"symbol": symbol, "name": name})
+
+    _SYMBOL_ROWS = rows
+    return rows
 
 
 def load_prices_df(
-    ticker: str, start_date: dt.date, end_date: Optional[dt.date] = None
+    ticker: str,
+    start_date: dt.date,
+    end_date: Optional[dt.date] = None
 ) -> pd.DataFrame:
-    """Load price rows from the DB (backfilling from yfinance when needed)."""
+    """Compatibility wrapper for legacy callers."""
 
-    ticker = ticker.upper().strip()
-    session = db.session
-
-    query = session.query(Stock).filter(
-        Stock.ticker == ticker,
-        func.date(Stock.date) >= start_date,
-    )
-    if end_date:
-        query = query.filter(func.date(Stock.date) <= end_date)
-
-    rows = query.order_by(Stock.date.asc()).all()
-
-    def _usable_count(rs):
-        return sum(1 for r in rs if r.close_price is not None)
-
-    if not rows or _usable_count(rows) < LOOKBACK_DAYS:
-        fetch_and_upsert_yfinance_stock(ticker, start_date, end_date)
-        rows = query.order_by(Stock.date.asc()).all()
-    if not rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(
-        [
-            {
-                "date": r.date,
-                "open_price": r.open_price,
-                "high_price": r.high_price,
-                "low_price": r.low_price,
-                "close_price": r.close_price,
-                "adj_close_price": r.adj_close_price,
-                "volume": r.volume,
-            }
-            for r in rows
-        ]
-    ).sort_values("date")
-    df["date"] = pd.to_datetime(df["date"]).dt.date
-    return df.reset_index(drop=True)
-
-
-def rolling_mean(arr: np.ndarray, window: int) -> Optional[float]:
-    """Return the mean of the last `window` entries, guarding against NaNs."""
-
-    if len(arr) < window:
-        return None
-    sample = arr[-window:]
-    mask = np.isfinite(sample)
-    if mask.sum() < window:
-        return None
-    return float(sample.mean())
-
-
-def rolling_std(arr: np.ndarray, window: int) -> Optional[float]:
-    """Return the stddev of the last `window` entries, guarding against NaNs."""
-
-    if len(arr) < window:
-        return None
-    sample = arr[-window:]
-    mask = np.isfinite(sample)
-    if mask.sum() < window:
-        return None
-    return float(sample.std(ddof=0))
-
-
-def compute_features(close_series, momentum_w: int, vol_w: int) -> Optional[np.ndarray]:
-    """Return [volatility, momentum] features for the given close series."""
-
-    closes = np.asarray(close_series, dtype=float)
-    if closes.size < max(momentum_w, vol_w) + 1:
-        return None
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        rets = np.diff(closes) / closes[:-1]
-    mom = rolling_mean(rets, momentum_w)
-    vol = rolling_std(rets, vol_w)
-    if mom is None or vol is None or not np.isfinite(mom) or not np.isfinite(vol):
-        return None
-    return np.array([vol, mom], dtype=float)
-
-
-def normalize_features(X: np.ndarray) -> np.ndarray:
-    """Min-max normalize each feature column to the [0, 1] interval."""
-
-    Xn = X.copy()
-    for j in range(X.shape[1]):
-        col = X[:, j]
-        cmin, cmax = np.nanmin(col), np.nanmax(col)
-        if not np.isfinite(cmin) or not np.isfinite(cmax) or cmax == cmin:
-            Xn[:, j] = 0.0
-        else:
-            Xn[:, j] = (col - cmin) / (cmax - cmin)
-    return Xn
-
-
-def score_stock_row(row_norm: np.ndarray, risk: str) -> float:
-    """Convert normalized [volatility, momentum] into a scalar score."""
-
-    vol_norm, mom_norm = float(row_norm[0]), float(row_norm[1])
-
-    risk = (risk or "balanced").lower()
-    if risk == "conservative":
-        w_mom, w_vol = 0.25, 0.75
-    elif risk == "aggressive":
-        w_mom, w_vol = 0.75, 0.25
-    else:
-        w_mom, w_vol = 0.5, 0.5
-
-    mom_util = 1 / (1 + np.exp(-mom_norm))
-    vol_util = 1 / (1 + np.exp(vol_norm))
-    return float(w_mom * mom_util + w_vol * vol_util)
-
-
-def choose_decision(score: float) -> str:
-    """Map a score into BUY/CONSIDER/HOLD buckets."""
-
-    if score >= 0.70:
-        return "BUY"
-    if score >= 0.55:
-        return "CONSIDER"
-    return "HOLD"
-
-
-def describe_regime(X_norm: np.ndarray) -> str:
-    """Return a simple text description of the feature regime."""
-
-    vol_bar, mom_bar = X_norm[:, 0].mean(), X_norm[:, 1].mean()
-    vol_str = (
-        "Low volatility"
-        if vol_bar < -0.3
-        else "Moderate volatility"
-        if vol_bar < 0.4
-        else "High volatility"
-    )
-    mom_str = (
-        "positive momentum"
-        if mom_bar > 0.2
-        else "mixed momentum"
-        if mom_bar > -0.2
-        else "negative momentum"
-    )
-    return f"{vol_str}, {mom_str}"
+    return crud.fetch_prices_from_yf(ticker, start_date, end_date)
 
 # ---------------------------------------------------------------------------
 # Evaluation helpers
@@ -332,13 +213,25 @@ def describe_regime(X_norm: np.ndarray) -> str:
 def _lookup_close_on_or_after(ticker: str, ts: dt.datetime) -> Optional[float]:
     """Return the first close_price recorded on or after the timestamp."""
 
-    row = (
-        db.session.query(Stock.close_price)
-        .filter(Stock.ticker == ticker, Stock.close_price.isnot(None), Stock.date >= ts)
-        .order_by(Stock.date.asc())
-        .first()
-    )
-    return float(row[0]) if row and row[0] is not None else None
+    if ts.tzinfo is None:
+        target = ts.replace(tzinfo=dt.timezone.utc)
+    else:
+        target = ts.astimezone(dt.timezone.utc)
+
+    start_date = target.date() - dt.timedelta(days=5)
+    end_date = target.date() + dt.timedelta(days=10)
+    df = crud.fetch_prices_from_yf(ticker, start_date, end_date)
+    if df.empty:
+        return None
+
+    df = df.sort_values("date")
+    for d, close in zip(df["date"], df["close_price"]):
+        if pd.isna(close):
+            continue
+        row_ts = dt.datetime.combine(d, dt.time.min, dt.timezone.utc)
+        if row_ts >= target:
+            return float(close)
+    return None
 
 
 def evaluate_prediction_accuracy(
@@ -350,28 +243,22 @@ def evaluate_prediction_accuracy(
     horizon_days = max(1, int(horizon_days))
     cutoff = dt.datetime.utcnow() - dt.timedelta(days=window_days)
 
-    preds = (
-        db.session.query(PredictionLog)
-        .filter(PredictionLog.timestamp >= cutoff)
-        .order_by(PredictionLog.timestamp.desc())
-        .limit(max_rows)
-        .all()
-    )
+    preds = load_recent_prediction_rows(limit=max_rows, cutoff=cutoff)
 
     evaluated: List[float] = []
     hits = buy_hits = buy_total = hold_hits = hold_total = 0
 
     for pred in preds:
-        entry_price = _lookup_close_on_or_after(pred.ticker, pred.timestamp)
+        entry_price = _lookup_close_on_or_after(pred["ticker"], pred["timestamp"])
         if entry_price in (None, 0):
             continue
-        future_ts = pred.timestamp + dt.timedelta(days=horizon_days)
-        future_price = _lookup_close_on_or_after(pred.ticker, future_ts)
+        future_ts = pred["timestamp"] + dt.timedelta(days=horizon_days)
+        future_price = _lookup_close_on_or_after(pred["ticker"], future_ts)
         if future_price is None:
             continue
 
         ret = (future_price - entry_price) / entry_price
-        decision = (pred.decision or "").upper()
+        decision = (pred["decision"] or "").upper()
         positive_call = decision in {"BUY", "CONSIDER"}
         is_hit = (ret > 0) if positive_call else (ret <= 0)
         hits += int(is_hit)
@@ -423,7 +310,8 @@ def api_history():
         return jsonify({"error": "ticker is required"}), 400
 
     start = parse_range_to_start(rng)
-    df = load_prices_df(ticker, start)
+    # df = load_prices_df(ticker, start)
+    df = crud.fetch_prices_from_yf(ticker, start)
     if df.empty:
         return jsonify([]), 200
 
@@ -480,63 +368,36 @@ def api_predict():
     if start is None:
         start = parse_range_to_start(rng)
 
-    k = int(safe_float(data.get("k"), 3) or 3)
-    momentum_w = int(safe_float(data.get("momentumWindow"), 20) or 20)
-    vol_w = int(safe_float(data.get("volWindow"), 20) or 20)
-    min_avg_vol = float(safe_float(data.get("minAvgVolume"), 300_000) or 300_000)
-    min_price = float(safe_float(data.get("minPrice"), 5) or 5)
+    k = int(crud.safe_float(data.get("k"), 3) or 3)
+    momentum_w = int(crud.safe_float(data.get("momentumWindow"), 20) or 20)
+    vol_w = int(crud.safe_float(data.get("volWindow"), 20) or 20)
+    min_avg_vol = float(crud.safe_float(data.get("minAvgVolume"), 300_000) or 300_000)
+    min_price = float(crud.safe_float(data.get("minPrice"), 5) or 5)
     risk = (data.get("riskProfile") or "balanced").lower()
-    alts = max(0, min(int(safe_float(data.get("alts"), 4) or 4), 5))
+    alts = max(0, min(int(crud.safe_float(data.get("alts"), 4) or 4), 5))
 
-    feats: List[np.ndarray] = []
-    names: List[str] = []
-    raw_features: Dict[str, Dict[str, float]] = {}
-    skipped: Dict[str, str] = {}
+    result = crud.run_prediction_pipeline(
+        tickers,
+        start=start,
+        end=end,
+        k=k,
+        momentum_w=momentum_w,
+        vol_w=vol_w,
+        min_avg_vol=min_avg_vol,
+        min_price=min_price,
+        risk=risk,
+        alts=alts,
+    )
 
-    for symbol in tickers:
-        df = load_prices_df(symbol, start, end)
-        if df.empty:
-            skipped[symbol] = "no data"
-            continue
-
-        df = df.dropna(subset=["close_price"])
-        if df.empty:
-            skipped[symbol] = "no close data"
-            continue
-
-        try:
-            avg_vol = float(df["volume"].tail(max(20, vol_w)).mean())
-        except Exception:
-            avg_vol = None
-        med_price = safe_float(df["close_price"].median())
-        if avg_vol is None or med_price is None:
-            skipped[symbol] = "bad volume/price"
-            continue
-        if avg_vol < min_avg_vol:
-            skipped[symbol] = f"avg volume {int(avg_vol):,} < {int(min_avg_vol):,}"
-            continue
-        if med_price < min_price:
-            skipped[symbol] = f"median price {med_price:.2f} < {min_price:.2f}"
-            continue
-
-        feat = compute_features(df["close_price"].tolist(), momentum_w, vol_w)
-        if feat is None:
-            skipped[symbol] = f"insufficient window (need >= {max(momentum_w, vol_w) + 1} rows)"
-            continue
-
-        feats.append(feat)
-        names.append(symbol)
-        raw_features[symbol] = {"volatility": float(feat[0]), "momentum": float(feat[1])}
-
-    if not feats:
+    if not result["best"]:
         return jsonify(
             {
                 "best": None,
                 "alternatives": [],
-                "regime": "Insufficient usable data across requested tickers.",
+                "regime": result["regime"],
                 "debug": {
-                    "skipped": skipped,
-                    "parsedTickers": names,
+                    "skipped": result["skipped"],
+                    "parsedTickers": tickers,
                     "start": start.isoformat(),
                     "end": (end and end.isoformat()),
                     "params": {
@@ -551,64 +412,45 @@ def api_predict():
             }
         ), 200
 
-    X = np.vstack(feats)
-    X_norm = normalize_features(X)
-
-    k = max(1, min(k, len(names)))
-    km = KMeans(n_clusters=k, random_state=42, max_iter=300)
-    km.fit(X)
-    labels = km.labels_
-
-    scores = [score_stock_row(row, risk) for row in X_norm]
-    order = np.argsort(scores)[::-1]
-    best_idx = int(order[0])
-    alt_idxs = [int(i) for i in order[1 : 1 + min(alts, len(order) - 1)]]
-
     best = {
-        "ticker": names[best_idx],
-        "score": round(float(scores[best_idx]), 4),
-        "cluster": int(labels[best_idx]),
+        "ticker": result["best"]["ticker"],
+        "score": result["best"]["score"],
+        "cluster": result["best"]["cluster"],
     }
     alternatives = [
-        {
-            "ticker": names[i],
-            "score": round(float(scores[i]), 4),
-            "cluster": int(labels[i]),
-        }
-        for i in alt_idxs
+        {"ticker": alt["ticker"], "score": alt["score"], "cluster": alt["cluster"]}
+        for alt in result["alternatives"]
     ]
 
-    regime = describe_regime(X_norm)
-
+    details = {
+        "scores": result["scores"],
+        "features": result["raw_features"],
+        "k": result["k"],
+        "labels": result["labels"],
+        "regime": result["regime"],
+        "thresholds": result["thresholds"],
+        "params": {
+            "momentumWindow": momentum_w,
+            "volWindow": vol_w,
+            "minAvgVolume": min_avg_vol,
+            "minPrice": min_price,
+            "riskProfile": risk,
+        },
+    }
     try:
-        decision = choose_decision(best["score"])
-        details = {
-            "scores": {names[i]: float(scores[i]) for i in range(len(names))},
-            "features": raw_features,
-            "k": k,
-            "labels": {names[i]: int(labels[i]) for i in range(len(names))},
-            "regime": regime,
-            "params": {
-                "momentumWindow": momentum_w,
-                "volWindow": vol_w,
-                "minAvgVolume": min_avg_vol,
-                "minPrice": min_price,
-                "riskProfile": risk,
-            },
-        }
-        db.session.add(
-            PredictionLog(
-                ticker=best["ticker"],
-                score=float(best["score"]),
-                decision=decision,
-                details=details,
-            )
+        append_recent_prediction(
+            {
+                "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "ticker": best["ticker"],
+                "score": float(result["best"]["score"]),
+                "decision": result["best"]["decision"],
+                "details": details,
+            }
         )
-        db.session.commit()
     except Exception:
-        db.session.rollback()
+        pass
 
-    return jsonify({"best": best, "alternatives": alternatives, "regime": regime}), 200
+    return jsonify({"best": best, "alternatives": alternatives, "regime": result["regime"]}), 200
 
 
 @app.get("/api/tickers/suggest")
@@ -616,23 +458,40 @@ def api_ticker_suggest():
     """Return ticker/name suggestions for the UI typeahead."""
 
     q = (request.args.get("q") or "").strip()
-    limit = request.args.get("limit", "12")
-    require_in_stocks_raw = (request.args.get("require_in_stocks") or "true").lower()
-    require_in_stocks = require_in_stocks_raw not in {"false", "0", "no"}
-
+    limit_raw = request.args.get("limit", "12")
     if not q:
         return jsonify([]), 200
 
     try:
-        suggestions = crud.suggest_tickers(
-            q,
-            limit=limit,
-            require_in_stocks=require_in_stocks,
-            include_inactive=False,
-        )
-        return jsonify(suggestions), 200
-    except Exception as exc:
-        return jsonify({"error": repr(exc)}), 500
+        limit = max(1, min(int(limit_raw), 50))
+    except ValueError:
+        limit = 12
+
+    rows = load_symbol_directory()
+    if not rows:
+        return jsonify([]), 200
+
+    q_upper = q.upper()
+    q_lower = q.lower()
+
+    matches: List[Dict[str, str]] = []
+    for row in rows:
+        symbol = row["symbol"]
+        name = row["name"]
+        prefix = symbol.startswith(q_upper)
+        contains = q_lower in name.lower() if name else False
+        if prefix or contains:
+            matches.append(
+                {
+                    "symbol": symbol,
+                    "name": name,
+                    "matchRank": 0 if prefix else 1,
+                }
+            )
+
+    matches.sort(key=lambda r: (r["matchRank"], r["symbol"]))
+    out = [{"symbol": m["symbol"], "name": m["name"]} for m in matches[:limit]]
+    return jsonify(out), 200
 
 
 @app.get("/api/metrics/accuracy")
@@ -654,56 +513,74 @@ def api_metrics_accuracy():
 def api_recent_predictions():
     """Return the most recent prediction log entries for monitoring."""
 
-    rows = (
-        db.session.query(PredictionLog)
-        .order_by(PredictionLog.timestamp.desc())
-        .limit(20)
-        .all()
-    )
-    out = [
-        {
-            "timestamp": r.timestamp.isoformat(),
-            "ticker": r.ticker,
-            "score": float(r.score),
-            "decision": r.decision,
-        }
-        for r in rows
-    ]
+    rows = load_recent_prediction_rows(limit=20)
+    out = []
+    for r in rows:
+        out.append(
+            {
+                "timestamp": r["timestamp"].isoformat(),
+                "ticker": r["ticker"],
+                "score": float(r["score"]),
+                "decision": r["decision"],
+            }
+        )
     return jsonify(out), 200
 
 
 @app.get("/api/status")
 def api_status():
-    """Return background population status + live DB counts."""
+    """Return a lightweight status payload without DB dependencies."""
+
+    recent = len(load_recent_prediction_rows(limit=5))
+    return jsonify({"status": "ok", "recentPredictions": recent}), 200
+
+
+def kickoff_population_job() -> bool:
+    """Trigger the Kaggle/price population background task."""
 
     try:
-        status = crud.get_population_status()
+        crud.kickoff_background_population()
+        return True
     except Exception as exc:
-        status = {"error": repr(exc)}
-    status["startup_triggered"] = _startup_once.is_set()
-    return jsonify(status), 200
+        app.logger.warning("kickoff_background_population failed: %s", exc)
+        return False
+
+
+@app.post("/api/population/kickoff")
+@api_key_required
+def api_kickoff_population():
+    """Endpoint to manually start the population worker."""
+
+    started = kickoff_population_job()
+    if not started:
+        return jsonify({"started": False, "error": "failed to start"}), 500
+    return jsonify({"started": True}), 202
+
+_thread_started = False
+_thread_lock = threading.Lock()
+
+def background_worker():
+    while True:
+        kickoff_population_job()
+        return False
+
+@app.before_request
+def _start_population_daemon():
+    """Ensure the Kaggle population job starts once per process."""
+
+    # kickoff_population_job()
+    global _thread_started
+    if not _thread_started:
+        with _thread_lock:
+            if not _thread_started:
+                t = threading.Thread(target=background_worker, daemon=True)
+                t.start()
+                _thread_started = True
 
 # ---------------------------------------------------------------------------
 # Startup hooks & entry point
 # ---------------------------------------------------------------------------
 
-@app.before_request
-def _kickoff_population_once():
-    """Kick off the background population job exactly once per process."""
-
-    if not STARTUP_POPULATE:
-        return
-    if _startup_once.is_set():
-        return
-
-    crud.kickoff_background_population(
-        verify_in_stocks=True,
-        use_batched_prices=True,
-        batch_size=64,
-    )
-    _startup_once.set()
-
-
 if __name__ == "__main__":
-    print("Connected to the db!")
+    # kickoff_population_job()
     app.run(debug=True, port=5000)

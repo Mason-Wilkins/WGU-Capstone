@@ -85,7 +85,6 @@ body { margin: 0; background: var(--bg); color: var(--text); font-family: ui-san
 .btn.primary:hover { filter: brightness(0.96); }
 .btn:hover { background: #f8fafc; }
 
-.toggles { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 16px; align-items: center; }
 .toggle { display: inline-flex; align-items: center; gap: 8px; font-size: 14px; color: var(--text); }
 
 /* Alerts */
@@ -102,7 +101,8 @@ body { margin: 0; background: var(--bg); color: var(--text); font-family: ui-san
 
 /* KPI */
 .grid { display: grid; gap: 12px; }
-.kpi-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.kpi-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.kpi-grid-wide { gap: 20px; }
 .kpi-title { font-size: 12px; color: var(--muted); }
 .kpi-main { margin-top: 6px; font-size: 22px; font-weight: 600; }
 .kpi-main.small { font-size: 16px; font-weight: 500; }

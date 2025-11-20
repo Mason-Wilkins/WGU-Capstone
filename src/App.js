@@ -176,15 +176,10 @@ export default function StockAdvisorDashboard() {
   const [historyMap, setHistoryMap] = useState({});     // {symbol: [{date, close, volume}]}
   const [predict, setPredict] = useState(null);   // { best, alternatives, regime }
   const [recent, setRecent] = useState([]);
-  const [accuracy, setAccuracy] = useState(null);
-  const [accuracyLoading, setAccuracyLoading] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
   // chart options
-  const [showMA5, setShowMA5] = useState(true);
-  const [showMA20, setShowMA20] = useState(true);
-  const [histBins, setHistBins] = useState(20);
   const [riskProfile, setRiskProfile] = useState("balanced");
   const [momentumWindow, setMomentumWindow] = useState(20);
   const [volWindow, setVolWindow] = useState(20);
@@ -209,21 +204,6 @@ export default function StockAdvisorDashboard() {
     const plural = rangeValue === 1 ? "" : "s";
     return `${rangeValue} ${unitLabel}${plural}`;
   }, [rangeValue, rangeUnit]);
-
-  const loadAccuracy = useCallback(async () => {
-    setAccuracyLoading(true);
-    try {
-      const qs = new URLSearchParams({ windowDays: 45, horizonDays: 5 }).toString();
-      const res = await fetch(`${API_BASE}/api/metrics/accuracy?${qs}`, { headers: AUTH_HEADERS });
-      if (!res.ok) throw new Error("accuracy fetch failed");
-      const data = await res.json();
-      setAccuracy(data);
-    } catch {
-      setAccuracy(null);
-    } finally {
-      setAccuracyLoading(false);
-    }
-  }, []);
 
   /* ----- Load history for chart ----- */
   const loadHistory = useCallback(
@@ -312,9 +292,17 @@ export default function StockAdvisorDashboard() {
         await Promise.all(others.map((sym) => loadHistory(sym, { silent: true })));
       } else {
         setSelected("");
-        setError(data?.regime || "No best recommendation returned by API.");
+        const skipped = data?.debug?.skipped;
+        if (skipped && Object.keys(skipped).length) {
+          const reasons = Object.entries(skipped)
+            .map(([sym, reason]) => `${sym}: ${reason}`)
+            .join("; ");
+          setError(`Insufficient usable data. ${reasons}`);
+        } else {
+          setError(data?.regime || "No best recommendation returned by API.");
+        }
       }
-      await loadAccuracy();
+      await loadRecent();
     } catch (e) {
       const msg = e?.message || "Failed to run prediction.";
       const maybeCORS = msg.includes("Failed to fetch") || msg.includes("TypeError");
@@ -328,22 +316,37 @@ export default function StockAdvisorDashboard() {
 
 
   /* ----- Recent predictions (monitoring) ----- */
-  const loadRecent = async () => {
+  const loadRecent = useCallback(async () => {
     try {
       const res = await fetch(`${API_BASE}/api/recent-predictions`, { headers: AUTH_HEADERS });
       if (!res.ok) return; // silently ignore
       const data = await res.json();
       if (Array.isArray(data)) setRecent(data);
     } catch {/* ignore */}
-  };
+  }, []);
 
-  useEffect(() => { loadRecent(); }, []);
-  useEffect(() => { loadAccuracy(); }, [loadAccuracy]);
+  useEffect(() => {
+    loadRecent();
+    const id = setInterval(loadRecent, 30000);
+    return () => clearInterval(id);
+  }, [loadRecent]);
 
   useEffect(() => {
     if (selected) loadHistory(selected);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected, loadHistory]);
+
+  useEffect(() => {
+    const loadAll = async () => {
+      await Promise.all(
+        selectedTickers.map((sym) => loadHistory(sym, { silent: true }))
+      );
+    };
+    if (selectedTickers.length) {
+      loadAll();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedTickers, rangeParam, loadHistory]);
 
   /* ----- Suggestions (debounced) ----- */
   useEffect(() => {
@@ -407,23 +410,10 @@ export default function StockAdvisorDashboard() {
     return { data: merged, symbols: Array.from(activeSymbols) };
   }, [historyMap]);
 
-  const priceChartData = useMemo(() => {
-    if (!selected || multiHistory.data.length === 0) return multiHistory.data;
-    const enrichedMap = new Map(enriched.map((row) => [row.date, row]));
-    return multiHistory.data.map((row) => {
-      const next = { ...row };
-      const match = enrichedMap.get(row.date);
-      if (match) {
-        next.__selected_ma5 = match.ma5;
-        next.__selected_ma20 = match.ma20;
-      }
-      return next;
-    });
-  }, [multiHistory.data, enriched, selected]);
 
   const { bars: histBars } = useMemo(
-    () => buildHistogram(returnsSeries, histBins),
-    [returnsSeries, histBins]
+    () => buildHistogram(returnsSeries, 20),
+    [returnsSeries]
   );
 
   const recentScores = useMemo(
@@ -438,17 +428,6 @@ export default function StockAdvisorDashboard() {
 
   const best = useMemo(() => (predict?.best ? predict.best : null), [predict]);
   const alternatives = useMemo(() => (predict?.alternatives ? predict.alternatives : []), [predict]);
-  const accuracySummary = useMemo(() => {
-    if (!accuracy || !accuracy.evaluated) return null;
-    const pct = (val) => (typeof val === "number" ? `${(val * 100).toFixed(1)}%` : "—");
-    return [
-      { label: "Hit Rate", value: pct(accuracy.hit_rate) },
-      { label: "Avg Return", value: `${(accuracy.avg_return_pct ?? 0).toFixed(2)}%` },
-      { label: "Median Return", value: `${(accuracy.median_return_pct ?? 0).toFixed(2)}%` },
-      { label: "Buy Precision", value: pct(accuracy.buy_precision) },
-      { label: "Hold Precision", value: pct(accuracy.hold_precision) },
-    ];
-  }, [accuracy]);
   const kpiColor = useMemo(() => {
     const s = best?.score ?? 0;
     if (s >= 0.7) return "kpi-green";
@@ -638,41 +617,6 @@ export default function StockAdvisorDashboard() {
           </div>
 
         </div>
-
-
-
-          <div className="toggles">
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={showMA5}
-                onChange={(e) => setShowMA5(e.target.checked)}
-              />
-              <span>Show MA5</span>
-            </label>
-            <label className="toggle">
-              <input
-                type="checkbox"
-                checked={showMA20}
-                onChange={(e) => setShowMA20(e.target.checked)}
-              />
-              <span>Show MA20</span>
-            </label>
-            <label className="toggle">
-              <span>Histogram bins:</span>
-              <input
-                type="number"
-                min="5"
-                max="60"
-                value={histBins}
-                onChange={(e) =>
-                  setHistBins(Math.max(5, Math.min(60, Number(e.target.value) || 20)))
-                }
-                className="input small"
-              />
-            </label>
-          </div>
-
           {error && (
             <div className="alert">
               <AlertTriangle className="icon-sm" />
@@ -685,85 +629,36 @@ export default function StockAdvisorDashboard() {
             </p>
           )}
 
-          <div className="info-box">
-            <p>
-              <strong>MA5</strong> and <strong>MA20</strong> are <em>moving averages</em>—the average closing price
-              over the last 5 and 20 trading days. <strong>MA5</strong> reacts quickly to short-term moves, while{" "}
-              <strong>MA20</strong> smooths noise to show a medium-term trend. When MA5 crosses above MA20, it can
-              suggest rising momentum; crossing below can indicate a potential downtrend.
-            </p>
+        </section>
+
+        {/* KPI Row */}
+        <section className="grid kpi-grid kpi-grid-wide">
+          <div className="card kpi">
+            <div className="kpi-title">Best Stock (Prescribed Choice)</div>
+            <div className="kpi-main">{best?.ticker ?? "—"}</div>
+            <div className={`kpi-sub ${kpiColor}`}>
+              Confidence Score: {(best?.score ?? 0).toFixed(2)}
+            </div>
+          </div>
+          <div className="card kpi">
+            <div className="kpi-title">Market Snapshot</div>
+            <div className="kpi-main small">{predict?.regime ?? "—"}</div>
+          </div>
+          <div className="card kpi">
+            <div className="kpi-title">Currently Viewing</div>
+            <div className="kpi-main">{selected || "—"}</div>
+            <div className="kpi-sub">Range: {rangeLabel}</div>
           </div>
         </section>
 
-        {/* KPI Row + Advisor */}
-        {predict && (
-          <section className="grid kpi-grid">
-            <div className="card kpi">
-              <div className="kpi-title">Best Stock (Prescribed Choice)</div>
-              <div className="kpi-main">{best?.ticker ?? "—"}</div>
-              <div className={`kpi-sub ${kpiColor}`}>
-                Confidence Score: {(best?.score ?? 0).toFixed(2)}
-              </div>
-              <div className="kpi-sub">Cluster: {best?.cluster ?? "—"}</div>
-            </div>
-            <div className="card kpi">
-              <div className="kpi-title">Market Regime</div>
-              <div className="kpi-main small">{predict?.regime ?? "—"}</div>
-            </div>
-            <div className="card kpi">
-              <div className="kpi-title">Currently Viewing</div>
-              <div className="kpi-main">{selected || "—"}</div>
-              <div className="kpi-sub">Range: {rangeLabel}</div>
-            </div>
-            <div className="card kpi">
-              <div className="kpi-title">Advisor</div>
-              <div className="kpi-advice">
-                {best?.score >= 0.7
-                  ? "High confidence — favorable momentum with controlled volatility."
-                  : best?.score >= 0.55
-                  ? "Moderate confidence — consider with caution; validate against fundamentals."
-                  : "Low confidence — hold or seek alternatives."}
-              </div>
-            </div>
-          </section>
-        )}
-
-        {/* Model accuracy overview */}
-        <section className="card accuracy-card">
-          <div className="accuracy-header">
-            <h3 className="card-title">Model Accuracy</h3>
-            {accuracy?.evaluated ? (
-              <div className="accuracy-window">
-                Window: last {accuracy.window_days}d • Horizon: {accuracy.horizon_days}d • Samples: {accuracy.evaluated}
-              </div>
-            ) : null}
-          </div>
-          {accuracyLoading && <div className="accuracy-placeholder">Loading…</div>}
-          {!accuracyLoading && accuracySummary && (
-            <div className="accuracy-metrics">
-              {accuracySummary.map(({ label, value }) => (
-                <div key={label} className="metric">
-                  <span className="metric-label">{label}</span>
-                  <span className="metric-value">{value}</span>
-                </div>
-              ))}
-            </div>
-          )}
-          {!accuracyLoading && !accuracySummary && (
-            <div className="accuracy-placeholder">
-              Not enough logged predictions yet. Run `/api/predict` to start collecting samples.
-            </div>
-          )}
-        </section>
-
-        {/* 1) Price History (Line) + MA5/MA20 */}
+        {/* 1) Price History (multi-line) */}
         <section className="card">
           <div className="card-header">
             <h2 className="card-title">Price History ({multiHistory.symbols.length || "0"} tickers)</h2>
           </div>
           {multiHistory.data.length > 0 ? (
             <div className="chart-wrap">
-              <LineChart width={880} height={300} data={priceChartData} margin={{ top: 10, right: 10, bottom: 0, left: 0 }}>
+              <LineChart width={880} height={300} data={multiHistory.data} margin={{ top: 10, right: 10, bottom: 0, left: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" />
                 <XAxis dataKey="date" minTickGap={24} />
                 <YAxis domain={["auto", "auto"]} />
@@ -781,28 +676,6 @@ export default function StockAdvisorDashboard() {
                     opacity={sym === selected ? 1 : 0.7}
                   />
                 ))}
-                {selected && showMA5 && (
-                  <Line
-                    type="monotone"
-                    dataKey="__selected_ma5"
-                    strokeWidth={1}
-                    dot={false}
-                    name={`${selected} MA5`}
-                    stroke="#94a3b8"
-                    strokeDasharray="4 4"
-                  />
-                )}
-                {selected && showMA20 && (
-                  <Line
-                    type="monotone"
-                    dataKey="__selected_ma20"
-                    strokeWidth={1}
-                    dot={false}
-                    name={`${selected} MA20`}
-                    stroke="#475569"
-                    strokeDasharray="6 4"
-                  />
-                )}
               </LineChart>
             </div>
           ) : (
@@ -932,16 +805,14 @@ export default function StockAdvisorDashboard() {
                   <tr>
                     <th>Ticker</th>
                     <th>Confidence</th>
-                    <th>Cluster</th>
                     <th>Action</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {alternatives.map(({ ticker, score, cluster }) => (
+                  {alternatives.map(({ ticker, score }) => (
                     <tr key={ticker}>
                       <td className="bold">{ticker}</td>
                       <td>{Number(score).toFixed(2)}</td>
-                      <td>{cluster}</td>
                       <td>
                         <button onClick={() => setSelected(ticker)} className="link">
                           View Chart
@@ -997,7 +868,12 @@ export default function StockAdvisorDashboard() {
         )}
       </main>
 
-      <footer className="app-footer"></footer>
+      <footer className="app-footer">
+        <p>
+          All insights are for educational purposes only. Always perform your own research and consult
+          a qualified financial advisor; the developers assume no liability for trading losses.
+        </p>
+      </footer>
     </div>
   );
 }
