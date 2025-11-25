@@ -34,7 +34,17 @@ CORS(
     app,
     resources={
         r"/api/*": {
-            "origins": ["http://localhost:3000", "http://127.0.0.1:3000"],
+            # Allowed frontend origins (add your deployed host/IP as needed)
+            "origins": [
+                origin
+                for origin in [
+                    "http://localhost:3000",
+                    "http://127.0.0.1:3000",
+                    "http://18.118.169.194",
+                    "http://3.139.185.31",
+                ]
+                if origin
+            ],
             "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
             "allow_headers": ["Content-Type", "Authorization"],
             "supports_credentials": False,

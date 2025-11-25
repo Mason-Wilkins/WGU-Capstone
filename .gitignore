@@ -69,3 +69,4 @@ react-with-flask/
 data/stock-market-dataset.zip
 models/
 recent_predictions.csv
+*.pem
