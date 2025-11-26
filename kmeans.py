@@ -40,8 +40,7 @@ class KMeans:
         """
         Compute k-means clustering on X.
         We standardize by default so one feature (e.g., volatility) does not drown out another (e.g., momentum).
-        References: scikit-learn user guide (https://scikit-learn.org/stable/modules/clustering.html#k-means),
-        Wikipedia overview (https://en.wikipedia.org/wiki/K-means_clustering).
+        References: scikit-learn user guide scikit-learn developers. (n.d.),
         """
         X = self._check_array(X)
         Xs = self._standardize_fit(X) if self.standardize else X
@@ -99,7 +98,7 @@ class KMeans:
         Main k-means loop: assign -> update until convergence or max_iter.
         This is the classic Lloyd/Forgy routine (Lloyd, 1982): regroup points around the nearest center,
         move centers to the middle of their group, repeat. Simple and reliable for small feature sets.
-        References: Lloyd/Forgy routine in scikit-learn KMeans docs
+        References: scikit-learn developers. (n.d.)
         (https://scikit-learn.org/stable/modules/generated/sklearn.cluster.KMeans.html).
         """
         for it in range(1, self.max_iter):
@@ -119,9 +118,7 @@ class KMeans:
     def _recompute_centers(self, Xs: np.ndarray, labels: np.ndarray, old_centers: np.ndarray) -> np.ndarray:
         """
         Recompute centroids; handle empty clusters by re-seeding to the farthest point
-        (matches scikit-learn KMeans fallback: https://scikit-learn.org/stable/modules/generated/sklearn.cluster.KMeans.html).
-        Related discussion in Wikipedia empty-cluster handling:
-        https://en.wikipedia.org/wiki/K-means_clustering#Empty_clusters.
+        (matches scikit-learn KMeans fallback: Reference: scikit-learn developers. (n.d.).
         If a cluster ends up with zero members, pick the farthest point and make it the new center.
         """
         K = self.n_clusters
@@ -157,8 +154,7 @@ class KMeans:
     def _kpp_init(self, Xs: np.ndarray) -> np.ndarray:
         """
         k-means++ initialization.
-        References: scikit-learn KMeans (https://scikit-learn.org/stable/modules/generated/sklearn.cluster.KMeans.html),
-        k-means++ summary in Wikipedia (https://en.wikipedia.org/wiki/K-means%2B%2B).
+        References: scikit-learn developers. (n.d.),
         Smart seeding to avoid bad first guesses; steadier results.
         """
         n_samples = Xs.shape[0]
@@ -229,3 +225,10 @@ class KMeans:
     def _check_is_fitted(self):
         if self.cluster_centers_ is None:
             raise RuntimeError("Model is not fitted yet. Call fit(X) first.")
+        
+
+# Documentation references:        
+# scikit-learn developers. (n.d.). sklearn.cluster.KMeans — scikit-learn documentation. https://scikit-learn.org/stable/modules/generated/sklearn.cluster.KMeans.html
+# SciPy developers. (n.d.). scipy.cluster.vq.kmeans — SciPy documentation. https://docs.scipy.org/doc/scipy/reference/generated/scipy.cluster.vq.kmeans.html
+# GeeksforGeeks. (n.d.). K-means++ Algorithm – ML. https://www.geeksforgeeks.org/machine-learning/ml-k-means-algorithm/
+# Real Python. (n.d.). K-means clustering in Python. https://realpython.com/k-means-clustering-python/
