@@ -1,96 +1,80 @@
 {
-  "requested_tickers": [
-    "AACB",
-    "AACG",
-    "AACI",
-    "AAL",
-    "AALG",
-    "AAME",
-    "AAOI",
-    "AAON",
-    "AAPB",
-    "AAPD",
-    "AAPG",
-    "AAPL"
-  ],
-  "result": {
-    "best": {
-      "ticker": "AAPL",
-      "score": 0.7018,
+  "best": {
+    "ticker": "AAPL",
+    "score": 0.7018,
+    "cluster": 2,
+    "decision": "BUY"
+  },
+  "alternatives": [
+    {
+      "ticker": "AAPD",
+      "score": 0.6332,
       "cluster": 2,
-      "decision": "BUY"
+      "decision": "CONSIDER"
     },
-    "alternatives": [
-      {
-        "ticker": "AAPD",
-        "score": 0.6332,
-        "cluster": 2,
-        "decision": "CONSIDER"
-      },
-      {
-        "ticker": "AAL",
-        "score": 0.5149,
-        "cluster": 0,
-        "decision": "CONSIDER"
-      },
-      {
-        "ticker": "AAON",
-        "score": 0.2964,
-        "cluster": 0,
-        "decision": "HOLD"
-      }
-    ],
-    "regime": "Moderate volatility, positive momentum",
-    "raw_features": {
-      "AAL": {
-        "volatility": 0.030353724283776525,
-        "momentum": 0.0033288034192154466
-      },
-      "AAOI": {
-        "volatility": 0.05910207652340821,
-        "momentum": -0.02210508910399108
-      },
-      "AAON": {
-        "volatility": 0.034165415726102176,
-        "momentum": -0.004068619295873519
-      },
-      "AAPD": {
-        "volatility": 0.009086597591237634,
-        "momentum": -0.0012961828999735548
-      },
-      "AAPL": {
-        "volatility": 0.009211033394957643,
-        "momentum": 0.0015031938385032667
-      }
+    {
+      "ticker": "AAL",
+      "score": 0.5149,
+      "cluster": 0,
+      "decision": "CONSIDER"
     },
-    "scores": {
-      "AAL": 0.514908992461538,
-      "AAOI": 0.02192857368480089,
-      "AAON": 0.2963803142767423,
-      "AAPD": 0.6331779825083268,
-      "AAPL": 0.7018234314463518
+    {
+      "ticker": "AAON",
+      "score": 0.2964,
+      "cluster": 0,
+      "decision": "HOLD"
+    }
+  ],
+  "regime": "Moderate volatility, positive momentum",
+  "raw_features": {
+    "AAL": {
+      "volatility": 0.030353724283776525,
+      "momentum": 0.0033288034192154466
     },
-    "labels": {
-      "AAL": 0,
-      "AAOI": 1,
-      "AAON": 0,
-      "AAPD": 2,
-      "AAPL": 2
+    "AAOI": {
+      "volatility": 0.05910207652340821,
+      "momentum": -0.02210508910399108
     },
-    "k": 3,
-    "thresholds": {
-      "buy": 0.65,
-      "consider": 0.45
+    "AAON": {
+      "volatility": 0.034165415726102176,
+      "momentum": -0.004068619295873519
     },
-    "skipped": {
-      "AACB": "avg volume 7,225 < 300,000",
-      "AACG": "avg volume 21,925 < 300,000",
-      "AACI": "avg volume 176,195 < 300,000",
-      "AALG": "avg volume 10,595 < 300,000",
-      "AAME": "avg volume 27,275 < 300,000",
-      "AAPB": "avg volume 153,430 < 300,000",
-      "AAPG": "avg volume 6,375 < 300,000"
+    "AAPD": {
+      "volatility": 0.009086597591237634,
+      "momentum": -0.0012961828999735548
     },
-    "silhouette": 0.6610200714717761
-  }
+    "AAPL": {
+      "volatility": 0.009211033394957643,
+      "momentum": 0.0015031938385032667
+    }
+  },
+  "scores": {
+    "AAL": 0.514908992461538,
+    "AAOI": 0.02192857368480089,
+    "AAON": 0.2963803142767423,
+    "AAPD": 0.6331779825083268,
+    "AAPL": 0.7018234314463518
+  },
+  "labels": {
+    "AAL": 0,
+    "AAOI": 1,
+    "AAON": 0,
+    "AAPD": 2,
+    "AAPL": 2
+  },
+  "k": 3,
+  "thresholds": {
+    "buy": 0.65,
+    "consider": 0.45
+  },
+  "skipped": {
+    "AACB": "avg volume 7,225 < 300,000",
+    "AACG": "avg volume 21,925 < 300,000",
+    "AACI": "avg volume 176,195 < 300,000",
+    "AALG": "avg volume 10,595 < 300,000",
+    "AAME": "avg volume 27,275 < 300,000",
+    "AAPB": "avg volume 153,430 < 300,000",
+    "AAPG": "avg volume 6,375 < 300,000"
+  },
+  "silhouette": 0.6610200714717761
 }

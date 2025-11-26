@@ -168,10 +168,7 @@ def run_sample_prediction(tickers: List[str]) -> Dict[str, object]:
         risk="balanced",
         alts=3,
     )
-    return {
-        "requested_tickers": top,
-        "result": payload,
-    }
+    return payload
 
 
 def save_json(path: Path, payload: Dict[str, object]) -> None:
