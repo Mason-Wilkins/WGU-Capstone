@@ -155,11 +155,12 @@ def run_sample_prediction(tickers: List[str]) -> Dict[str, object]:
 
     today = dt.date.today()
     start = today - dt.timedelta(days=365)
+    top = tickers[:12]  # grab more to increase odds of usable tickers
     payload = crud.run_prediction_pipeline(
-        tickers=tickers[:6],
+        tickers=top,
         start=start,
         end=None,
-        k=min(3, max(1, len(tickers[:6]))),
+        k=min(3, max(3, len(top))),
         momentum_w=20,
         vol_w=20,
         min_avg_vol=300_000,
@@ -168,7 +169,7 @@ def run_sample_prediction(tickers: List[str]) -> Dict[str, object]:
         alts=3,
     )
     return {
-        "requested_tickers": tickers[:6],
+        "requested_tickers": top,
         "result": payload,
     }
 
