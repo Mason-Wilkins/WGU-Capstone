@@ -1,5 +1,3 @@
-"""Flask API server for stock data, feature engineering, clustering, and scoring."""
-
 from __future__ import annotations
 
 import csv, json, os, re, statistics, threading 

@@ -1,4 +1,3 @@
-# --- add near top of crud.py (or keep your existing ones) ---
 import os
 import requests
 import datetime as dt
@@ -194,7 +193,7 @@ def normalize_features(X: np.ndarray) -> np.ndarray:
 
 
 def silhouette_score(X: np.ndarray, labels: np.ndarray) -> Optional[float]:
-    """Lightweight silhouette coefficient (no sklearn dependency)."""
+    """Lightweight silhouette coefficient."""
 
     if X.ndim != 2 or X.shape[0] < 3:
         return None
@@ -236,11 +235,6 @@ def silhouette_score(X: np.ndarray, labels: np.ndarray) -> Optional[float]:
 def score_stock_row(raw_row: np.ndarray, risk: str) -> float:
     """
     Convert raw (volatility, momentum) features into a smoother 0–1 confidence score.
-
-    Previously we normalized per-request (min/max across the submitted tickers), which
-    collapses to coarse values like 0.0, 0.5, or 1.0 when the list is short. Here we
-    instead map the absolute feature magnitudes through soft squashing functions so a
-    single ticker can still land anywhere in [0, 1].
     """
 
     vol = float(raw_row[0])
