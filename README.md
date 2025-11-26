@@ -1,4 +1,4 @@
-# Stock Recommender (WGU Capstone)
+# Stock Recommender
 
 Full-stack demo that pulls equity prices from yfinance, engineers momentum/volatility features, clusters tickers with a custom K-Means implementation, and surfaces BUY/CONSIDER/HOLD guidance plus recent prediction logs in a React dashboard.
 
@@ -45,6 +45,7 @@ sudo apt-get install -y python3 python3-venv python3-pip nodejs npm git
    REACT_APP_API_BASE=http://localhost:5000
    REACT_APP_API_KEY=replace-with-strong-token
    EOF
+   # Run in a separate terminal while the backend is running:
    npm start  # http://localhost:3000
    ```
 
@@ -53,18 +54,6 @@ sudo apt-get install -y python3 python3-venv python3-pip nodejs npm git
 - Production build: `npm run build` (outputs `./build`)
 - Ensure the frontend `.env` and backend `API_AUTH_TOKEN` match before running or building.
 
-## Common API calls
-- History: `GET /api/history?ticker=MSFT&range=6mo`
-- Predict (requires API key):  
-```bash
-curl -X POST http://localhost:5000/api/predict \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: replace-with-strong-token" \
-  -d '{"tickers":["AAPL","MSFT","NVDA"],"range":"1y","riskProfile":"balanced"}'
-```
-- Recent predictions: `GET /api/recent-predictions`
-- Accuracy (requires API key): `GET /api/metrics/accuracy?windowDays=45&horizonDays=5`
-
 ## Model validation & testing
 - **Cluster quality (Silhouette Coefficient)**: run `python3 generate_artifacts.py` to compute an internal validation metric for the KMeans clustering (silhouette in [-1, 1]; higher means tighter, better-separated clusters). The script saves `reports/model_validation.json` with the silhouette, inertia, and cluster sizes, plus `reports/sample_prediction.json` showing a real prediction payload for a handful of tickers.
 - **Temporal hit-rate backtest**: use the `/api/metrics/accuracy` endpoint (or `evaluate_prediction_accuracy` in `server.py`) with a window (e.g., 45 days) and horizon (e.g., 5 days). It compares past BUY/CONSIDER/HOLD calls to realized forward returns and reports hit rates for positive (BUY/CONSIDER) vs HOLD decisions.
@@ -72,10 +61,6 @@ curl -X POST http://localhost:5000/api/predict \
 
 ## Notes
 - yfinance provides prices via YFinance's api; no database is required.
-
-## Minimal single-box deployment (optional)
-- For local work, use `python server.py` (Flask dev server on http://localhost:5000) and `npm start` (frontend on http://localhost:3000).
-- For a static build, run `npm run build` and serve the `build/` directory with a simple static server (e.g., `serve -s build`) while keeping the Flask dev server running on http://localhost:5000.
 
 ## Troubleshooting
 - yfinance errors: retry or reduce ticker lists; ensure internet access.
