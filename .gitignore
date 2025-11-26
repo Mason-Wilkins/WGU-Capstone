@@ -66,6 +66,7 @@ react-with-flask/
 # DATABASE / MISC
 # =========================
 *.sql
+.env
 data/stock-market-dataset.zip
 models/
 recent_predictions.csv

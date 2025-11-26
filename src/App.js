@@ -191,6 +191,7 @@ export default function StockAdvisorDashboard() {
   const [suggest, setSuggest] = useState([]);
   const [showSuggest, setShowSuggest] = useState(false);
   const [suggestLoading, setSuggestLoading] = useState(false);
+  const [sampleClusters, setSampleClusters] = useState({ points: [], centroids: [], silhouette: null });
 
   const handleClearAll = useCallback(() => {
     setSelectedTickers([]);
@@ -228,7 +229,10 @@ export default function StockAdvisorDashboard() {
           setError("");
         }
         const qs = new URLSearchParams({ ticker, range: rangeParam }).toString();
-        const res = await fetch(`${API_BASE}/api/history?${qs}`, { headers: AUTH_HEADERS });
+        const res = await fetch(`${API_BASE}/api/history?${qs}`, {
+          headers: AUTH_HEADERS,
+          credentials: "include",
+        });
         const t1 = performance.now();
         if (!silent) setApiHealth({ ok: res.ok, ms: Math.round(t1 - t0) });
 
@@ -288,6 +292,7 @@ export default function StockAdvisorDashboard() {
       const res = await fetch(`${API_BASE}/api/predict`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...AUTH_HEADERS },
+        credentials: "include",
         body: JSON.stringify(body),
       });
 
@@ -329,7 +334,10 @@ export default function StockAdvisorDashboard() {
   /* ----- Recent predictions (monitoring) ----- */
   const loadRecent = useCallback(async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/recent-predictions`, { headers: AUTH_HEADERS });
+      const res = await fetch(`${API_BASE}/api/recent-predictions`, {
+        headers: AUTH_HEADERS,
+        credentials: "include",
+      });
       if (!res.ok) return; // silently ignore
       const data = await res.json();
       if (Array.isArray(data)) setRecent(data);
@@ -341,6 +349,27 @@ export default function StockAdvisorDashboard() {
     const id = setInterval(loadRecent, 30000);
     return () => clearInterval(id);
   }, [loadRecent]);
+
+  useEffect(() => {
+    const fetchSampleClusters = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/clusters/sample?limit=25`, {
+          headers: AUTH_HEADERS,
+          credentials: "include",
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        setSampleClusters({
+          points: Array.isArray(data?.points) ? data.points : [],
+          centroids: Array.isArray(data?.centroids) ? data.centroids : [],
+          silhouette: Number.isFinite(data?.silhouette) ? data.silhouette : null,
+        });
+      } catch {
+        setSampleClusters({ points: [], centroids: [], silhouette: null });
+      }
+    };
+    fetchSampleClusters();
+  }, []);
 
   useEffect(() => {
     if (selected) loadHistory(selected);
@@ -371,7 +400,10 @@ export default function StockAdvisorDashboard() {
       try {
         setSuggestLoading(true);
         const qs = new URLSearchParams({ q, limit: 16 }).toString();
-        const res = await fetch(`${API_BASE}/api/tickers/suggest?${qs}`, { headers: AUTH_HEADERS });
+        const res = await fetch(`${API_BASE}/api/tickers/suggest?${qs}`, {
+          headers: AUTH_HEADERS,
+          credentials: "include",
+        });
         if (!res.ok) throw new Error("suggest failed");
         const data = await res.json();
         // Expecting: [{symbol, name}] from your server
@@ -421,11 +453,126 @@ export default function StockAdvisorDashboard() {
     return { data: merged, symbols: Array.from(activeSymbols) };
   }, [historyMap]);
 
+  const multiMetrics = useMemo(() => {
+    const volumeByDate = new Map();
+    const returnsByDate = new Map();
+    const volByDate = new Map();
+    const cumByDate = new Map();
+    const symbols = Object.keys(historyMap || {}).filter(
+      (k) => Array.isArray(historyMap[k]) && historyMap[k].length > 0
+    );
+
+    const std = (arr) => {
+      const m = arr.reduce((a, b) => a + b, 0) / arr.length;
+      const v = arr.reduce((a, b) => a + (b - m) ** 2, 0) / arr.length;
+      return Math.sqrt(v);
+    };
+
+    const upsert = (map, date, ticker, value) => {
+      const key = date;
+      if (!map.has(key)) map.set(key, { date: key });
+      map.get(key)[ticker] = value;
+    };
+
+    symbols.forEach((ticker) => {
+      const rows = (historyMap[ticker] || []).slice().sort((a, b) => new Date(a.date) - new Date(b.date));
+      if (!rows.length) return;
+      let prevClose = null;
+      let base = null;
+      const retWindow = [];
+      rows.forEach((row) => {
+        const close = Number(row.close);
+        const vol = Number(row.volume);
+        if (base === null && Number.isFinite(close)) base = close;
+
+        // Volume
+        if (Number.isFinite(vol)) upsert(volumeByDate, row.date, ticker, vol);
+
+        // Returns
+        let ret = null;
+        if (Number.isFinite(close) && Number.isFinite(prevClose) && prevClose !== 0) {
+          ret = (close - prevClose) / prevClose;
+        }
+        if (ret !== null) {
+          upsert(returnsByDate, row.date, ticker, ret);
+          retWindow.push(ret);
+          if (retWindow.length > 20) retWindow.shift();
+          if (retWindow.length === 20) {
+            upsert(volByDate, row.date, ticker, std(retWindow));
+          }
+        }
+        prevClose = Number.isFinite(close) ? close : prevClose;
+
+        // Cumulative
+        if (Number.isFinite(close) && Number.isFinite(base) && base !== 0) {
+          upsert(cumByDate, row.date, ticker, close / base - 1);
+        }
+      });
+    });
+
+    const toSorted = (map) =>
+      Array.from(map.values()).sort((a, b) => new Date(a.date) - new Date(b.date));
+
+    return {
+      symbols,
+      volumeData: toSorted(volumeByDate),
+      returnsData: toSorted(returnsByDate),
+      volData: toSorted(volByDate),
+      cumData: toSorted(cumByDate),
+    };
+  }, [historyMap]);
+
 
   const { bars: histBars } = useMemo(
     () => buildHistogram(returnsSeries, 20),
     [returnsSeries]
   );
+
+  const clusterSeries = useMemo(() => {
+    const feats = predict?.raw_features || {};
+    const labels = predict?.labels || {};
+    const buckets = {};
+    Object.entries(feats).forEach(([sym, vals]) => {
+      const cluster = Number.isFinite(labels[sym]) ? Number(labels[sym]) : null;
+      if (cluster === null) return;
+      const vol = Number(vals?.volatility);
+      const mom = Number(vals?.momentum);
+      if (!Number.isFinite(vol) || !Number.isFinite(mom)) return;
+      if (!buckets[cluster]) buckets[cluster] = [];
+      buckets[cluster].push({ ticker: sym, vol, mom, cluster });
+    });
+    return Object.entries(buckets)
+      .sort((a, b) => Number(a[0]) - Number(b[0]))
+      .map(([cluster, points]) => ({ cluster: Number(cluster), points }));
+  }, [predict]);
+
+  const clusterCenters = useMemo(() => {
+    return clusterSeries.map(({ cluster, points }) => {
+      const vol = points.reduce((s, p) => s + p.vol, 0) / points.length;
+      const mom = points.reduce((s, p) => s + p.mom, 0) / points.length;
+      return { cluster, vol, mom };
+    });
+  }, [clusterSeries]);
+
+  const clusterTickerLabels = useMemo(() => {
+    const out = {};
+    clusterSeries.forEach(({ cluster, points }) => {
+      const names = points.map((p) => p.ticker).sort();
+      const head = names.slice(0, 6).join(", ");
+      const more = names.length > 6 ? `, +${names.length - 6} more` : "";
+      out[cluster] = `${head}${more}`;
+    });
+    return out;
+  }, [clusterSeries]);
+
+  const skippedTickers = useMemo(() => predict?.skipped || {}, [predict]);
+
+  const silhouetteScore = useMemo(() => {
+    const s = predict?.silhouette;
+    if (Number.isFinite(s)) return s;
+    if (Number.isFinite(sampleClusters?.silhouette)) return sampleClusters.silhouette;
+    return null;
+  }, [predict, sampleClusters]);
 
   const recentScores = useMemo(
     () =>
@@ -438,7 +585,6 @@ export default function StockAdvisorDashboard() {
   );
 
   const best = useMemo(() => (predict?.best ? predict.best : null), [predict]);
-  const alternatives = useMemo(() => (predict?.alternatives ? predict.alternatives : []), [predict]);
   const kpiColor = useMemo(() => {
     const s = best?.score ?? 0;
     if (s >= 0.7) return "kpi-green";
@@ -667,6 +813,7 @@ export default function StockAdvisorDashboard() {
           <div className="card-header">
             <h2 className="card-title">Price History ({multiHistory.symbols.length || "0"} tickers)</h2>
           </div>
+          <p className="muted">Overlay of closing prices for all selected tickers over the chosen range to compare trends side by side.</p>
           {multiHistory.data.length > 0 ? (
             <div className="chart-wrap">
               <LineChart width={880} height={300} data={multiHistory.data} margin={{ top: 10, right: 10, bottom: 0, left: 0 }}>
@@ -697,6 +844,7 @@ export default function StockAdvisorDashboard() {
         {/* 2) Volume (Bar) */}
         <section className="card">
           <h3 className="card-title mb">Daily Volume {selected ? `– ${selected}` : ""}</h3>
+          <p className="muted">Shows trading activity; thin volume can make prices noisy and is filtered out by the model.</p>
           {enriched.length > 0 ? (
             <div className="chart-wrap">
               <BarChart width={880} height={240} data={enriched} margin={{ top: 10, right: 10, bottom: 0, left: 0 }}>
@@ -716,14 +864,20 @@ export default function StockAdvisorDashboard() {
         {/* 3) Returns Histogram */}
         <section className="card">
           <h3 className="card-title mb">Daily Returns Histogram</h3>
+          <p className="muted">Distribution of day-to-day returns; wider spread means higher volatility.</p>
           {histBars.length > 0 ? (
             <div className="chart-wrap">
-              <BarChart width={880} height={240} data={histBars} margin={{ top: 10, right: 10, bottom: 40, left: 0 }}>
+              <BarChart
+                width={880}
+                height={240}
+                data={histBars}
+                margin={{ top: 30, right: 10, bottom: 60, left: 0 }}
+              >
                 <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey="bin" angle={-35} textAnchor="end" interval={0} />
+                <XAxis dataKey="bin" angle={-35} textAnchor="end" interval={0} tickMargin={12} />
                 <YAxis />
                 <Tooltip />
-                <Legend />
+                <Legend verticalAlign="top" align="left" />
                 <Bar dataKey="count" name="Count" />
               </BarChart>
             </div>
@@ -735,6 +889,7 @@ export default function StockAdvisorDashboard() {
         {/* 4) Rolling Volatility */}
         <section className="card">
           <h3 className="card-title mb">Rolling Volatility (20D Std of Returns)</h3>
+          <p className="muted">Tracks how turbulent the recent price moves are; the model prefers lower volatility for conservative risk.</p>
           {volSeries.length > 0 ? (
             <div className="chart-wrap">
               <LineChart width={880} height={220} data={volSeries} margin={{ top: 10, right: 10, bottom: 0, left: 0 }}>
@@ -754,6 +909,7 @@ export default function StockAdvisorDashboard() {
         {/* 5) Cumulative Returns */}
         <section className="card">
           <h3 className="card-title mb">Cumulative Return (from start of range)</h3>
+          <p className="muted">Shows the total return from the first date in the selected range; good for seeing overall trend direction.</p>
           {cumSeries.length > 0 ? (
             <div className="chart-wrap">
               <LineChart width={880} height={220} data={cumSeries} margin={{ top: 10, right: 10, bottom: 0, left: 0 }}>
@@ -774,6 +930,7 @@ export default function StockAdvisorDashboard() {
         {recentScores.length > 0 && (
           <section className="card">
             <h3 className="card-title mb">Recent Prediction Scores</h3>
+            <p className="muted">Recent confidence scores logged by the model; higher means stronger BUY/CONSIDER leaning at the time.</p>
             <div className="chart-wrap">
               <LineChart width={880} height={220} data={recentScores} margin={{ top: 10, right: 10, bottom: 0, left: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" />
@@ -790,6 +947,7 @@ export default function StockAdvisorDashboard() {
         {/* 7) Momentum vs Volatility (Scatter) */}
         <section className="card">
           <h3 className="card-title mb">Momentum vs Volatility (20D) {selected ? `– ${selected}` : ""}</h3>
+          <p className="muted">Rolling momentum vs. volatility for the selected ticker; used as inputs to clustering and scoring.</p>
           {hasEnough ? (
             <div className="chart-wrap">
               <ScatterChart width={880} height={260} margin={{ top: 10, right: 10, bottom: 0, left: 0 }}>
@@ -806,36 +964,90 @@ export default function StockAdvisorDashboard() {
           )}
         </section>
 
-        {/* Alternatives */}
-        {alternatives.length > 0 && (
-          <section className="card">
-            <h3 className="card-title mb">Other Candidates (Context Only)</h3>
-            <div className="table-wrap">
-              <table className="table">
-                <thead>
-                  <tr>
-                    <th>Ticker</th>
-                    <th>Confidence</th>
-                    <th>Action</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {alternatives.map(({ ticker, score }) => (
-                    <tr key={ticker}>
-                      <td className="bold">{ticker}</td>
-                      <td>{Number(score).toFixed(2)}</td>
-                      <td>
-                        <button onClick={() => setSelected(ticker)} className="link">
-                          View Chart
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+        {/* 8) Clustering view (current prediction run) */}
+        <section className="card">
+          <h3 className="card-title mb">Clustering (volatility vs. momentum)</h3>
+          <p className="muted">
+            Shows how K-Means groups tickers by volatility and momentum. Colors = your latest /api/predict run; diamonds = centroids (cluster centers).
+            The gray “reference cloud” is a baseline clustering of common tickers so you can compare your run against a broader sample.
+          </p>
+          {Number.isFinite(silhouetteScore) && (
+            <div className="kpi-row">
+              <div className="kpi">
+                <div className="kpi-label">Silhouette (cluster quality)</div>
+                <div className="kpi-main">{silhouetteScore.toFixed(3)}</div>
+                <div className="kpi-sub">
+                  Scale [-1, 1]: near 1 means points are tight and well-separated; near 0 means clusters overlap; below 0 means likely mis-clustered.
+                </div>
+              </div>
             </div>
-          </section>
-        )}
+          )}
+          {clusterSeries.length > 0 || (sampleClusters.points && sampleClusters.points.length > 0) ? (
+            <div className="chart-wrap">
+              <ScatterChart width={880} height={260} margin={{ top: 10, right: 10, bottom: 0, left: 0 }}>
+                <CartesianGrid />
+                <XAxis type="number" dataKey="vol" name="Volatility" tickFormatter={(v) => v.toFixed(3)} />
+                <YAxis type="number" dataKey="mom" name="Momentum" tickFormatter={(v) => v.toFixed(3)} />
+                <Tooltip formatter={(v, name, props) => [Number(v).toFixed(4), name]} labelFormatter={() => ""} />
+                <Legend />
+                {sampleClusters.points?.length > 0 && (
+                  <Scatter
+                    name="Reference cloud"
+                    data={sampleClusters.points}
+                    fill="#cbd5e1"
+                    opacity={0.6}
+                  />
+                )}
+                {clusterSeries.map(({ cluster, points }) => (
+                  <Scatter
+                    key={cluster}
+                    name={`Cluster ${cluster}`}
+                    data={points}
+                    fill={LINE_COLORS[cluster % LINE_COLORS.length]}
+                  />
+                ))}
+                {sampleClusters.centroids?.length > 0 && (
+                  <Scatter
+                    name="Reference centroids"
+                    data={sampleClusters.centroids}
+                    shape="diamond"
+                    legendType="diamond"
+                    fill="#94a3b8"
+                  />
+                )}
+                {clusterCenters.map(({ cluster, vol, mom }) => (
+                  <Scatter
+                    key={`c-${cluster}`}
+                    name={`Centroid ${cluster}${clusterTickerLabels[cluster] ? ` (${clusterTickerLabels[cluster]})` : ""}`}
+                    data={[{ vol, mom }]}
+                    shape="diamond"
+                    legendType="diamond"
+                    fill={LINE_COLORS[cluster % LINE_COLORS.length]}
+                  />
+                ))}
+              </ScatterChart>
+            </div>
+          ) : (
+            <div className="empty">No clustering results yet. Run a prediction to populate.</div>
+          )}
+          {clusterSeries.length > 0 && (
+            <div className="muted" style={{ marginTop: "8px" }}>
+              {clusterSeries.map(({ cluster }) => (
+                <div key={`cluster-label-${cluster}`}>
+                  <strong>Cluster {cluster}:</strong> {clusterTickerLabels[cluster] || "—"}
+                </div>
+              ))}
+            </div>
+          )}
+          {skippedTickers && Object.keys(skippedTickers).length > 0 && (
+            <div className="muted" style={{ marginTop: "8px" }}>
+              <strong>Filtered out:</strong>{" "}
+              {Object.entries(skippedTickers)
+                .map(([sym, reason]) => `${sym}: ${reason}`)
+                .join("; ")}
+            </div>
+          )}
+        </section>
 
         {/* Recent Predictions */}
         {recent.length > 0 && (

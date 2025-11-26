@@ -37,7 +37,12 @@ class KMeans:
 
 
     def fit(self, X: np.ndarray) -> "KMeans":
-        """Compute k-means clustering on X."""
+        """
+        Compute k-means clustering on X.
+        We standardize by default so one feature (e.g., volatility) does not drown out another (e.g., momentum).
+        References: scikit-learn user guide (https://scikit-learn.org/stable/modules/clustering.html#k-means),
+        Wikipedia overview (https://en.wikipedia.org/wiki/K-means_clustering).
+        """
         X = self._check_array(X)
         Xs = self._standardize_fit(X) if self.standardize else X
 
@@ -90,7 +95,13 @@ class KMeans:
             self, Xs: np.ndarray,
             centers: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray, float, int]:
-        """Main k-means loop: assign -> update until convergence or max_iter."""
+        """
+        Main k-means loop: assign -> update until convergence or max_iter.
+        This is the classic Lloyd/Forgy routine (Lloyd, 1982): regroup points around the nearest center,
+        move centers to the middle of their group, repeat. Simple and reliable for small feature sets.
+        References: Lloyd/Forgy routine in scikit-learn KMeans docs
+        (https://scikit-learn.org/stable/modules/generated/sklearn.cluster.KMeans.html).
+        """
         for it in range(1, self.max_iter):
             labels = self._nearest_labels(Xs, centers)
             new_centers = self._recompute_centers(Xs, labels, centers)
@@ -106,7 +117,13 @@ class KMeans:
         return labels, centers, inertia, self.max_iter
         
     def _recompute_centers(self, Xs: np.ndarray, labels: np.ndarray, old_centers: np.ndarray) -> np.ndarray:
-        """Recompute centroids; handle empty clusters by re-seeding to farthest point."""
+        """
+        Recompute centroids; handle empty clusters by re-seeding to the farthest point
+        (matches scikit-learn KMeans fallback: https://scikit-learn.org/stable/modules/generated/sklearn.cluster.KMeans.html).
+        Related discussion in Wikipedia empty-cluster handling:
+        https://en.wikipedia.org/wiki/K-means_clustering#Empty_clusters.
+        If a cluster ends up with zero members, pick the farthest point and make it the new center.
+        """
         K = self.n_clusters
         n_features = Xs.shape[1]
         centers = np.zeros((K, n_features), dtype=Xs.dtype)
@@ -138,7 +155,12 @@ class KMeans:
             raise ValueError('init must be "random" or "k-means++"')
 
     def _kpp_init(self, Xs: np.ndarray) -> np.ndarray:
-        """k-means++ initialization."""
+        """
+        k-means++ initialization.
+        References: scikit-learn KMeans (https://scikit-learn.org/stable/modules/generated/sklearn.cluster.KMeans.html),
+        k-means++ summary in Wikipedia (https://en.wikipedia.org/wiki/K-means%2B%2B).
+        Smart seeding to avoid bad first guesses; steadier results.
+        """
         n_samples = Xs.shape[0]
         centers = np.empty((self.n_clusters, Xs.shape[1]), dtype=float)
 
@@ -181,6 +203,7 @@ class KMeans:
         return d2
 
     def _standardize_fit(self, X: np.ndarray) -> np.ndarray:
+        # Put every feature on the same scale so one number can't overwhelm the others.
         self._mean = X.mean(axis=0)
         self._std = X.std(axis=0, ddof=0)
         self._std[self._std == 0.0] = 1.0

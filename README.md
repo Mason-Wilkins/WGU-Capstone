@@ -5,50 +5,53 @@ Full-stack demo that pulls equity prices from yfinance, engineers momentum/volat
 ## What’s here
 - `server.py` — Flask API (`/api/predict`, `/api/history`, `/api/metrics/accuracy`, `/api/tickers/suggest`)
 - `crud.py` — price fetchers (yfinance), feature engineering, Kaggle metadata helpers
-- `kmeans.py` — lightweight NumPy K-Means used by the pipeline
+- `kmeans.py` — lightweight K-Means used by the pipeline
 - `src/` — React app (Create React App + Recharts)
 - `recent_predictions.csv` — append-only log for accuracy metrics (created on first POST to `/api/predict`)
+- No database or SQLAlchemy dependencies; everything is in-memory with yfinance plus CSV logs.
 
 ## Prerequisites
 - Python 3.10+
 - Node.js 18+ (with npm)
 - Git
-- Optional: Kaggle CLI for bulk metadata refresh
 
-## Quick start (local)
-1) Clone and install backend deps  
+Ubuntu quick install:
 ```bash
-python3 -m venv env
-source env/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
+sudo apt-get update
+sudo apt-get install -y python3 python3-venv python3-pip nodejs npm git
 ```
 
-2) Set backend env vars (replace with strong values)  
-```bash
-export FLASK_APP_SECRET_KEY="dev-secret"
-export API_AUTH_TOKEN="replace-with-strong-token"
-# Optional tuning
-export ACCURACY_WINDOW_DAYS=45
-export ACCURACY_HORIZON_DAYS=5
-```
+## Local setup
+1) Backend
+   ```bash
+   python3 -m venv env
+   source env/bin/activate
+   pip install --upgrade pip
+   pip install -r requirements.txt
 
-3) Run the API  
-```bash
-FLASK_ENV=development python server.py
-# listens on http://localhost:5000
-```
+   export FLASK_APP_SECRET_KEY="dev-secret"
+   export API_AUTH_TOKEN="replace-with-strong-token"
+   # optional tuning
+   export ACCURACY_WINDOW_DAYS=45
+   export ACCURACY_HORIZON_DAYS=5
 
-4) Install frontend deps and run UI  
-```bash
-npm ci
-cat > .env <<'EOF'
-REACT_APP_API_BASE=http://localhost:5000
-REACT_APP_API_KEY=replace-with-strong-token
-EOF
-npm start
-# visit http://localhost:3000
-```
+   FLASK_ENV=development python server.py  # http://localhost:5000
+   ```
+
+2) Frontend
+   ```bash
+   npm ci
+   cat > .env <<'EOF'
+   REACT_APP_API_BASE=http://localhost:5000
+   REACT_APP_API_KEY=replace-with-strong-token
+   EOF
+   npm start  # http://localhost:3000
+   ```
+
+## Build and serve the frontend
+- Development: `npm start` (CRA dev server on http://localhost:3000, proxying to your API)
+- Production build: `npm run build` (outputs `./build`)
+- Ensure the frontend `.env` and backend `API_AUTH_TOKEN` match before running or building.
 
 ## Common API calls
 - History: `GET /api/history?ticker=MSFT&range=6mo`
@@ -62,38 +65,17 @@ curl -X POST http://localhost:5000/api/predict \
 - Recent predictions: `GET /api/recent-predictions`
 - Accuracy (requires API key): `GET /api/metrics/accuracy?windowDays=45&horizonDays=5`
 
-## Using it in a notebook
-```python
-import datetime as dt
-from crud import run_prediction_pipeline
+## Model validation & testing
+- **Cluster quality (Silhouette Coefficient)**: run `python3 generate_artifacts.py` to compute an internal validation metric for the KMeans clustering (silhouette in [-1, 1]; higher means tighter, better-separated clusters). The script saves `reports/model_validation.json` with the silhouette, inertia, and cluster sizes, plus `reports/sample_prediction.json` showing a real prediction payload for a handful of tickers.
+- **Temporal hit-rate backtest**: use the `/api/metrics/accuracy` endpoint (or `evaluate_prediction_accuracy` in `server.py`) with a window (e.g., 45 days) and horizon (e.g., 5 days). It compares past BUY/CONSIDER/HOLD calls to realized forward returns and reports hit rates for positive (BUY/CONSIDER) vs HOLD decisions.
+- **Manual spot checks**: invoke `/api/predict` with a short ticker list (e.g., 5–10 names) and verify scores/decisions are plausible given recent price action; combine with `/api/history` plots in the UI for context.
 
-tickers = ["AAPL", "MSFT", "NVDA", "AMZN"]
-start = dt.date.today() - dt.timedelta(days=365)
+## Notes
+- yfinance provides prices via YFinance's api; no database is required.
 
-result = run_prediction_pipeline(
-    tickers=tickers,
-    start=start,
-    end=None,
-    k=3,
-    momentum_w=20,
-    vol_w=20,
-    min_avg_vol=300_000,
-    min_price=5,
-    risk="balanced",
-    alts=4,
-)
-print(result["best"], result["alternatives"])
-```
-yfinance provides prices on the fly; no database is required for notebook experiments.
-
-## Minimal single-box deployment (for a few evaluators)
-- Build frontend: `npm ci && npm run build`
-- Run backend with Gunicorn:  
-  ```bash
-  source env/bin/activate
-  API_AUTH_TOKEN=... FLASK_APP_SECRET_KEY=... gunicorn -b 0.0.0.0:5000 server:app
-  ```
-- Serve `build/` with nginx and proxy `/api/` to `http://127.0.0.1:5000`. Ensure CORS in `server.py` includes your host if not using the default localhost origins.
+## Minimal single-box deployment (optional)
+- For local work, use `python server.py` (Flask dev server on http://localhost:5000) and `npm start` (frontend on http://localhost:3000).
+- For a static build, run `npm run build` and serve the `build/` directory with a simple static server (e.g., `serve -s build`) while keeping the Flask dev server running on http://localhost:5000.
 
 ## Troubleshooting
 - yfinance errors: retry or reduce ticker lists; ensure internet access.

@@ -193,9 +193,70 @@ def normalize_features(X: np.ndarray) -> np.ndarray:
     return Xn
 
 
-def score_stock_row(row_norm: np.ndarray, risk: str) -> float:
-    vol_norm = np.clip(float(row_norm[0]), 0.0, 1.0)
-    mom_norm = np.clip(float(row_norm[1]), 0.0, 1.0)
+def silhouette_score(X: np.ndarray, labels: np.ndarray) -> Optional[float]:
+    """Lightweight silhouette coefficient (no sklearn dependency)."""
+
+    if X.ndim != 2 or X.shape[0] < 3:
+        return None
+    uniq = np.unique(labels)
+    if uniq.size < 2:
+        return None
+
+    # Pairwise distances
+    diff = X[:, None, :] - X[None, :, :]
+    dists = np.sqrt((diff * diff).sum(axis=2))
+
+    out = []
+    for i in range(X.shape[0]):
+        same = labels == labels[i]
+        other = ~same
+
+        a_vals = dists[i, same]
+        a_vals = a_vals[a_vals > 0]
+        a = a_vals.mean() if a_vals.size else 0.0
+
+        b = None
+        for lbl in uniq:
+            if lbl == labels[i]:
+                continue
+            mask = labels == lbl
+            if mask.sum() == 0:
+                continue
+            mean_dist = dists[i, mask].mean()
+            b = mean_dist if b is None else min(b, mean_dist)
+        if b is None or max(a, b) == 0:
+            s = 0.0
+        else:
+            s = (b - a) / max(a, b)
+        out.append(s)
+
+    return float(np.mean(out)) if out else None
+
+
+def score_stock_row(raw_row: np.ndarray, risk: str) -> float:
+    """
+    Convert raw (volatility, momentum) features into a smoother 0–1 confidence score.
+
+    Previously we normalized per-request (min/max across the submitted tickers), which
+    collapses to coarse values like 0.0, 0.5, or 1.0 when the list is short. Here we
+    instead map the absolute feature magnitudes through soft squashing functions so a
+    single ticker can still land anywhere in [0, 1].
+    """
+
+    vol = float(raw_row[0])
+    mom = float(raw_row[1])
+
+    # Map momentum (average daily return) into [0, 1]; ~1% avg daily return ≈ 0.88
+    MOM_SCALE = 0.01
+    mom_util = 0.5 + 0.5 * np.tanh(mom / MOM_SCALE)
+
+    # Map volatility (stdev of daily returns) into [0, 1]; ~2.5% stdev is neutral.
+    VOL_CENTER = 0.025
+    VOL_SCALE = 0.02
+    vol_util = 1.0 - (0.5 + 0.5 * np.tanh((vol - VOL_CENTER) / VOL_SCALE))
+
+    mom_util = float(np.clip(mom_util, 0.0, 1.0))
+    vol_util = float(np.clip(vol_util, 0.0, 1.0))
 
     risk = (risk or "balanced").lower()
     if risk == "conservative":
@@ -205,8 +266,6 @@ def score_stock_row(row_norm: np.ndarray, risk: str) -> float:
     else:
         w_mom, w_vol = 0.5, 0.5
 
-    mom_util = mom_norm
-    vol_util = 1.0 - vol_norm
     return float(w_mom * mom_util + w_vol * vol_util)
 
 
@@ -360,7 +419,7 @@ def run_prediction_pipeline(
     km.fit(X)
     labels = km.labels_
 
-    scores = [score_stock_row(row, risk) for row in X_norm]
+    scores = [score_stock_row(row, risk) for row in X]
     buy_thr, consider_thr = compute_decision_thresholds(scores)
     order = np.argsort(scores)[::-1]
     best_idx = int(order[0])
@@ -369,6 +428,7 @@ def run_prediction_pipeline(
     regime = describe_regime(X_norm)
     labels_map = {names[i]: int(labels[i]) for i in range(len(names))}
     scores_map = {names[i]: float(scores[i]) for i in range(len(names))}
+    sil = silhouette_score(X_norm, labels)
 
     best = {
         "ticker": names[best_idx],
@@ -396,4 +456,5 @@ def run_prediction_pipeline(
         "k": k,
         "thresholds": {"buy": buy_thr, "consider": consider_thr},
         "skipped": skipped,
+        "silhouette": sil,
     }

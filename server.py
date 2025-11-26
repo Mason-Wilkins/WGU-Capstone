@@ -13,6 +13,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 
 import crud
+from kmeans import KMeans
 
 # ---------------------------------------------------------------------------
 # Flask setup & runtime configuration
@@ -27,6 +28,7 @@ DEFAULT_METRICS_HORIZON = int(os.getenv("ACCURACY_HORIZON_DAYS", "5") or 5)
 RECENT_PREDICTIONS_FILE = Path("recent_predictions.csv")
 PREDICTION_FIELDS = ["timestamp", "ticker", "score", "decision", "details"]
 _SYMBOL_ROWS: List[Dict[str, str]] | None = None
+_SAMPLE_CACHE: Dict[Any, Any] = {}
 
 app = Flask(__name__)
 app.secret_key = FLASK_APP_SECRET_KEY
@@ -34,20 +36,11 @@ CORS(
     app,
     resources={
         r"/api/*": {
-            # Allowed frontend origins (add your deployed host/IP as needed)
-            "origins": [
-                origin
-                for origin in [
-                    "http://localhost:3000",
-                    "http://127.0.0.1:3000",
-                    "http://18.118.169.194",
-                    "http://3.139.185.31",
-                ]
-                if origin
-            ],
+            "origins": ["http://localhost:5000", "http://localhost:3000", "http://127.0.0.1:3000"],
             "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-            "allow_headers": ["Content-Type", "Authorization"],
-            "supports_credentials": False,
+            # include X-API-Key since the UI sends it and allow cookies via credentials: "include"
+            "allow_headers": ["Content-Type", "Authorization", "X-API-Key"],
+            "supports_credentials": True,
         }
     },
 )
@@ -126,6 +119,16 @@ def _ensure_predictions_csv() -> None:
         writer.writeheader()
 
 
+def _normalize_ts(ts: Optional[dt.datetime]) -> Optional[dt.datetime]:
+    """Return a tz-naive UTC datetime for consistent comparisons."""
+
+    if ts is None:
+        return None
+    if ts.tzinfo is None:
+        return ts
+    return ts.astimezone(dt.timezone.utc).replace(tzinfo=None)
+
+
 def append_recent_prediction(record: Dict[str, Any]) -> None:
     """Append a prediction record to the CSV log."""
 
@@ -147,6 +150,7 @@ def load_recent_prediction_rows(
 ) -> List[Dict[str, Any]]:
     """Load predictions from CSV, optionally filtering by time and limit."""
 
+    cutoff = _normalize_ts(cutoff)
     if not RECENT_PREDICTIONS_FILE.exists():
         return []
     rows: List[Dict[str, Any]] = []
@@ -158,6 +162,7 @@ def load_recent_prediction_rows(
                 ts = dt.datetime.fromisoformat(ts_raw) if ts_raw else None
             except Exception:
                 ts = None
+            ts = _normalize_ts(ts)
             if ts is None:
                 continue
             if cutoff and ts < cutoff:
@@ -207,6 +212,104 @@ def load_symbol_directory() -> List[Dict[str, str]]:
     return rows
 
 
+def _load_sample_tickers(limit: int = 25) -> List[str]:
+    path = Path("tickers.csv")
+    allow = Path("tickers_allowlist.txt")
+    allow_syms = set(
+        line.strip().upper()
+        for line in (allow.read_text().splitlines() if allow.exists() else [])
+        if line.strip()
+    )
+
+    def ok(sym: str) -> bool:
+        return sym.isalpha() and not sym.endswith(("W", "R", "U"))
+
+    if path.exists():
+        out: List[str] = []
+        for line in path.read_text().splitlines():
+            sym = line.strip().upper()
+            if not sym:
+                continue
+            if ok(sym) or sym in allow_syms:
+                out.append(sym)
+            if len(out) >= limit:
+                break
+        if out:
+            return out
+
+    return ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA"][:limit]
+
+
+def _compute_sample_clusters(limit: int = 25) -> Dict[str, Any]:
+    tickers = _load_sample_tickers(limit)
+    start = dt.date.today() - dt.timedelta(days=365)
+
+    result = crud.run_prediction_pipeline(
+        tickers=tickers,
+        start=start,
+        end=None,
+        k=min(3, max(2, len(tickers))),
+        momentum_w=20,
+        vol_w=20,
+        min_avg_vol=200_000,
+        min_price=2,
+        risk="balanced",
+        alts=0,
+    )
+
+    feats = result.get("raw_features") or {}
+    labels = result.get("labels") or {}
+    points = []
+    for sym, vals in feats.items():
+        if sym not in labels:
+            continue
+        try:
+            vol = float(vals.get("volatility"))
+            mom = float(vals.get("momentum"))
+        except Exception:
+            continue
+        points.append(
+            {
+                "ticker": sym,
+                "vol": vol,
+                "mom": mom,
+                "cluster": int(labels[sym]),
+            }
+        )
+
+    # Compute centroids from points
+    centroids = []
+    by_cluster: Dict[int, List[Dict[str, float]]] = {}
+    for p in points:
+        by_cluster.setdefault(p["cluster"], []).append(p)
+    for cl, arr in sorted(by_cluster.items()):
+        vol_avg = sum(a["vol"] for a in arr) / len(arr)
+        mom_avg = sum(a["mom"] for a in arr) / len(arr)
+        centroids.append({"cluster": cl, "vol": vol_avg, "mom": mom_avg})
+
+    return {
+        "points": points,
+        "centroids": centroids,
+        "k": result.get("k"),
+        "silhouette": result.get("silhouette"),
+        "tickers": tickers,
+    }
+
+
+def _get_sample_clusters(limit: int = 25) -> Dict[str, Any]:
+    now = dt.datetime.now(dt.timezone.utc)
+    cache = _SAMPLE_CACHE.get(limit) if isinstance(_SAMPLE_CACHE, dict) else None
+    if cache and cache.get("expires") and cache["expires"] > now:
+        return cache["payload"]
+
+    payload = _compute_sample_clusters(limit)
+    _SAMPLE_CACHE[limit] = {
+        "expires": now + dt.timedelta(hours=6),
+        "payload": payload,
+    }
+    return payload
+
+
 def load_prices_df(
     ticker: str,
     start_date: dt.date,
@@ -251,7 +354,7 @@ def evaluate_prediction_accuracy(
 
     window_days = max(1, int(window_days))
     horizon_days = max(1, int(horizon_days))
-    cutoff = dt.datetime.utcnow() - dt.timedelta(days=window_days)
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=window_days)
 
     preds = load_recent_prediction_rows(limit=max_rows, cutoff=cutoff)
 
@@ -460,7 +563,23 @@ def api_predict():
     except Exception:
         pass
 
-    return jsonify({"best": best, "alternatives": alternatives, "regime": result["regime"]}), 200
+    return (
+        jsonify(
+            {
+                "best": best,
+                "alternatives": alternatives,
+                "regime": result["regime"],
+                "silhouette": result.get("silhouette"),
+                "raw_features": result.get("raw_features", {}),
+                "labels": result.get("labels", {}),
+                "scores": result.get("scores", {}),
+                "thresholds": result.get("thresholds", {}),
+                "k": result.get("k"),
+                "skipped": result.get("skipped", {}),
+            }
+        ),
+        200,
+    )
 
 
 @app.get("/api/tickers/suggest")
@@ -515,8 +634,29 @@ def api_metrics_accuracy():
     except ValueError:
         return jsonify({"error": "windowDays and horizonDays must be integers"}), 400
 
-    metrics = evaluate_prediction_accuracy(window, horizon)
+    try:
+        metrics = evaluate_prediction_accuracy(window, horizon)
+    except Exception as exc:
+        return jsonify({"error": f"failed to compute metrics: {exc}"}), 500
     return jsonify(metrics), 200
+
+
+@app.get("/api/clusters/sample")
+def api_clusters_sample():
+    """Return a reference clustering cloud to visualize K-Means even before predictions."""
+
+    try:
+        limit = int(request.args.get("limit") or 25)
+        limit = max(5, min(limit, 60))
+    except ValueError:
+        limit = 25
+
+    try:
+        payload = _get_sample_clusters(limit)
+    except Exception as exc:
+        return jsonify({"error": f"failed to build sample clusters: {exc}"}), 500
+
+    return jsonify(payload), 200
 
 
 @app.get("/api/recent-predictions")
